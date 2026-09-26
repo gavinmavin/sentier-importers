@@ -6,13 +6,46 @@ A source's declarative configuration lives in ``registry.yaml`` and is parsed in
 framework supplies validate → emit → deliver via the pipeline driver.
 """
 
+import re
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 from sentier_importers.core import fetch as fetch_mod
 from sentier_importers.core import parse as parse_mod
 from sentier_importers.core.context import RunContext
+from sentier_importers.core.errors import SourceContractError
 from sentier_importers.core.types import RawData, Records, Rows
+
+_STEP_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+_FRAMEWORK_STEP_NAMES = {
+    "fetch",
+    "parse",
+    "deduplicate",
+    "assemble",
+    "validate",
+    "emit",
+    "deliver",
+}
+
+
+@dataclass(frozen=True)
+class TransformStep:
+    """One source-owned, observable transformation in an ordered pipeline."""
+
+    name: str
+    description: str
+    function: Callable[[Records], Records]
+
+    def __post_init__(self) -> None:
+        if not _STEP_NAME.fullmatch(self.name):
+            raise SourceContractError(
+                f"transform step name {self.name!r} must use lower-kebab spelling"
+            )
+        if not self.description.strip():
+            raise SourceContractError(f"transform step {self.name!r} needs a description")
+        if not callable(self.function):
+            raise SourceContractError(f"transform step {self.name!r} function is not callable")
 
 
 @dataclass(frozen=True)
@@ -85,3 +118,30 @@ class Source(ABC):
     @abstractmethod
     def transform(self, records: Records) -> Rows:
         """Map parsed records to rows shaped for the target. Source-specific."""
+
+    def transform_steps(self) -> Sequence[TransformStep]:
+        """Return ordered, observable source transformations.
+
+        This default adapter preserves existing plugins as one ``transform`` child.
+        New and migrated plugins should declare each meaningful operation separately.
+        """
+        description = self.transform.__doc__ or f"Transform {self.config.name} records."
+        return (TransformStep("transform", description.strip(), self.transform),)
+
+    def declared_transform_steps(self) -> tuple[TransformStep, ...]:
+        """Validate and freeze the source's ordered transformation contract."""
+        steps = tuple(self.transform_steps())
+        if not steps:
+            raise SourceContractError(f"source {self.config.name!r} declares no transform steps")
+        names = [step.name for step in steps]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        if duplicates:
+            raise SourceContractError(
+                f"source {self.config.name!r} repeats transform step names: {duplicates}"
+            )
+        reserved = sorted(set(names) & _FRAMEWORK_STEP_NAMES)
+        if reserved:
+            raise SourceContractError(
+                f"source {self.config.name!r} uses framework step names: {reserved}"
+            )
+        return steps

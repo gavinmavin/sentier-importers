@@ -839,6 +839,30 @@ sources:
   # replaces the folder whole; sources never share a folder. emit_filename
   # gives the contract file names.
 
+  # Workspace-only teaching example. The script copies these outputs to
+  # sentier-inventory/examples/98-test, outside the live data/ sector folders.
+  - name: bafu-test-processes
+    module: sentier_importers.sources.bafu.test_inventory_processes
+    target: sentier_inventory
+    category: 98-test
+    emit_filename: processes
+    fetch:
+      url: "file://${SENTIER_DATA_ROOT}/bafu-test/BAFU_test.zip"
+      format: zip
+    output_format: parquet
+    enabled: false
+
+  - name: bafu-test-exchanges
+    module: sentier_importers.sources.bafu.test_inventory_exchanges
+    target: sentier_inventory
+    category: 98-test
+    emit_filename: exchanges
+    fetch:
+      url: "file://${SENTIER_DATA_ROOT}/bafu-test/BAFU_test.zip"
+      format: zip
+    output_format: parquet
+    enabled: false
+
   - name: bafu-processes
     module: sentier_importers.sources.bafu.inventory_processes
     target: sentier_inventory

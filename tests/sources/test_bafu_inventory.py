@@ -75,6 +75,21 @@ def test_processes_sector_column_sits_after_process_type():
     ]
 
 
+def test_processes_declares_mapping_for_whole_source_release():
+    source = BafuInventoryProcessesSource(
+        _cfg("bafu-processes", "inventory_processes")
+    )
+    assert [step.name for step in source.declared_transform_steps()] == [
+        "map-process-rows",
+    ]
+    records = source.parse(fixture_zip())
+    rows = records
+    for step in source.declared_transform_steps():
+        rows = step.function(rows)
+    assert rows == source.transform(records)
+    assert {row["process_id"] for row in rows} == set(FIXTURE_SECTORS)
+
+
 def test_processes_row_matches_inventory_schema():
     row = _process(UUID_ELEC)
     assert row["name"] == "Electricity, at test plant"
@@ -158,7 +173,8 @@ def test_registry_declares_full_bafu_family():
     # term files + 6 per-compartment flow term files + the curated crosswalk
     # (biosphere-1-curated) + the public-matching crosswalk (biosphere-3-matched)
     # + the coverage sidecar + the nomenclature crosswalk (biosphere-4-nomenclature)
-    assert len(bafu) == 24
+    # + the isolated 98-test process/exchange teaching pair.
+    assert len(bafu) == 26
     assert all(not c.enabled for c in bafu)  # opt-in: run locally, no auto delivery
 
     mappings = [c for c in bafu if c.target == "sentier_mappings"]
@@ -177,11 +193,15 @@ def test_registry_declares_full_bafu_family():
     }
 
     # the inventory folder is the source release: data/bafu-2026-v1/{processes,exchanges}
-    inventory = {c.name: c for c in bafu if c.target == "sentier_inventory"}
+    inventory = {c.name: c for c in bafu if c.target == "sentier_inventory" and not c.name.startswith("bafu-test-")}
     assert list(inventory) == ["bafu-processes", "bafu-exchanges"]
     assert {c.category for c in inventory.values()} == {ecospold.SOURCE_FOLDER}
     assert [c.emit_filename for c in inventory.values()] == ["processes", "exchanges"]
     assert {c.access for c in inventory.values()} == {"licensed"}
+
+    examples = [c for c in bafu if c.name.startswith("bafu-test-")]
+    assert len(examples) == 2
+    assert {c.category for c in examples} == {"98-test"}
 
     vocab = [c for c in bafu if c.target == "sentier_vocab"]
     processes = {c.emit_filename for c in vocab if c.category == "processes"}

@@ -30,3 +30,4 @@ class RunContext:
     schema_dir: Path | None = None
     deliver_local_root: Path | None = None
     data_root: Path | None = None
+    lineage_dir: Path | None = None

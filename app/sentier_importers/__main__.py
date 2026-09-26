@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 from platformdirs import user_cache_dir
-from sentier_importers.core import pipeline, registry
+from sentier_importers.core import lineage, pipeline, registry
 from sentier_importers.core.context import RunContext
 from sentier_importers.core.errors import MissingInputError, SentierImporterError
 
@@ -37,6 +37,7 @@ def _ctx(args: argparse.Namespace) -> RunContext:
         deliver_local_root=(
             Path(args.deliver_local) if getattr(args, "deliver_local", None) else None
         ),
+        lineage_dir=(Path(args.lineage_dir) if getattr(args, "lineage_dir", None) else None),
     )
 
 
@@ -55,6 +56,11 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
         "--schema-dir",
         default=None,
         help="Validate against schemas in this local dir instead of the target's pinned ref.",
+    )
+    parser.add_argument(
+        "--lineage-dir",
+        default=None,
+        help="Write OpenLineage JSONL here (default: <output-dir>/lineage).",
     )
 
 
@@ -78,12 +84,14 @@ def _warn_skipped(exc: MissingInputError, name: str) -> None:
 def cmd_validate(args: argparse.Namespace) -> None:
     config = registry.get_config(args.source, data_root=_data_root(args))
     source = registry.load_source(config)
+    ctx = _ctx(args)
     try:
-        count = pipeline.validate_source(source, _ctx(args))
+        count = pipeline.validate_source(source, ctx)
     except MissingInputError as exc:
         _warn_skipped(exc, config.name)
         return
     print(f"{config.name}: {count} rows valid")
+    print(f"lineage {lineage.lineage_path(config, ctx)}")
 
 
 def cmd_run(args: argparse.Namespace) -> None:
@@ -101,6 +109,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             _warn_skipped(exc, config.name)
             continue
         print(f"wrote {out}")
+        print(f"lineage {lineage.lineage_path(config, ctx)}")
 
 
 def build_parser() -> argparse.ArgumentParser:
