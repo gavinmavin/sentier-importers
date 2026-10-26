@@ -100,7 +100,10 @@ def _existing_index(
         name = entry.get("name", "")
         if not name.endswith((".yaml", ".yml")):
             continue
-        collection = yaml.safe_load(fetch_mod.fetch(entry["download_url"], ctx).content) or {}
+        raw = fetch_mod.fetch(entry["download_url"], ctx)
+        if ctx.dependency_observer is not None:
+            ctx.dependency_observer("existing-" + name, entry["download_url"], raw)
+        collection = yaml.safe_load(raw.content) or {}
         for item in collection.get(items_key, []) or []:
             iri = item.get("iri")
             if iri is not None:

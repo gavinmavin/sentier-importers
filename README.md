@@ -20,11 +20,7 @@ flowchart LR
 ```
 
 - The framework owns the driver and the shared services: cached fetch, parsers, dedup, LinkML validation, YAML/JSON/Parquet writers, PR delivery.
-- A source declares itself in `app/sentier_importers/registry.yaml` and declares its ordered transformations with `transform_steps()` in `app/sentier_importers/sources/<name>/source.py`.
-
-Every run also writes `output/lineage/<source>.openlineage.jsonl`. The import is the
-parent OpenLineage job. Framework stages and source-declared transformations are child
-jobs linked to that parent with the standard `ParentRunFacet`.
+- A source declares itself in `app/sentier_importers/registry.yaml` and implements `transform` in `app/sentier_importers/sources/<name>/source.py`.
 
 ## Install
 
@@ -35,6 +31,12 @@ uv sync --extra dev
 ```
 
 ## Use
+
+See the [lineage guide](openlineage/README.md) for the source/transform contracts,
+provenance declarations, four local examples, and Marquez inspection commands.
+Normal `run` and `validate` commands support `--input-file` for a local primary
+input and `--source-provenance` for its reusable registry declaration. Generated
+data and lineage records are local outputs, not part of this repository.
 
 List registered sources, their targets, and whether they are enabled:
 
@@ -60,56 +62,6 @@ Options for `run`. The last three rows also apply to `validate`:
 | `--offline` | fail on any fetch cache miss |
 | `--cache-dir`, `--output-dir` | override the fetch cache and the staging dir |
 | `--schema-dir` | validate against local schemas instead of the target's pinned ref |
-| `--lineage-dir` | write the OpenLineage JSONL to this directory |
-
-## Transformation steps and lineage
-
-Declare each meaningful source-owned operation separately. Step names are stable
-lower-kebab identifiers and descriptions become OpenLineage job documentation:
-
-```python
-from sentier_importers.core.source import Source, TransformStep
-
-
-class ExampleSource(Source):
-    def transform(self, records):
-        # Compatibility entry point for callers outside the pipeline.
-        return self.map_rows(self.filter_records(records))
-
-    def transform_steps(self):
-        return (
-            TransformStep(
-                "filter-records",
-                "Keep records in the requested sector.",
-                self.filter_records,
-            ),
-            TransformStep(
-                "map-rows",
-                "Map source fields to the target row contract.",
-                self.map_rows,
-            ),
-        )
-```
-
-The output of each function is passed to the next function. Source steps may not reuse
-framework names such as `fetch`, `parse`, `validate`, or `emit`. Existing plugins that
-only implement `transform()` are represented as one child job named `transform` until
-they are migrated.
-
-The generated JSONL contains `START` and `COMPLETE` events for the parent and every
-successful child. A failed operation emits child and parent `FAIL` events with the
-OpenLineage error-message facet before the original exception is raised.
-
-Completed child events also include:
-
-- a standard `sourceCodeLocation` job facet linking to the Python callable and line;
-- a standard dataset `schema` facet and a `sentier_preview` facet with up to five rows;
-- standard input and output statistics with the observed row count; and
-- a `sentier_transformation` run facet with input/output row and column counts, rows
-  removed, and the names of removed and added columns.
-
-The versioned schemas for the two Sentier facets live in
-`openlineage/facets/1-0-0/`.
 
 ## Layout
 
@@ -152,7 +104,7 @@ A missing local input is a warning, not an error: `validate` and `run` print the
 
 ## Contributing
 
-1. Add `app/sentier_importers/sources/<name>/source.py` with a `Source` subclass that declares `transform_steps()`. Override `fetch` or `parse` only if the input needs it.
+1. Add `app/sentier_importers/sources/<name>/source.py` with a `Source` subclass that implements `transform`. Override `fetch` or `parse` only if the input needs it.
 2. Add a block to `registry.yaml`.
 3. Add tests under `tests/sources/` with a cached fetch fixture. Tests run offline.
 

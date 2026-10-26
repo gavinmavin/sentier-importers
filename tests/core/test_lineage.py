@@ -3,8 +3,41 @@ import json
 import pytest
 from sentier_importers.core import pipeline
 from sentier_importers.core.context import RunContext
-from sentier_importers.core.lineage import PRODUCER, lineage_path
+from sentier_importers.core.lineage import PRODUCER, external_dataset, lineage_path, local_dataset
 from sentier_importers.core.source import Source, SourceConfig, TransformStep
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        r"file://C:\data\source_data\BAFU-2026 v1_ecoSpold v1.zip",
+        "file://C:/data/source_data/BAFU-2026 v1_ecoSpold v1.zip",
+        "file:///C:/data/source_data/BAFU-2026%20v1_ecoSpold%20v1.zip",
+    ],
+)
+def test_windows_source_identity_is_independent_of_file_url_spelling(url):
+    dataset = external_dataset(url)
+    assert dataset.namespace == "sentier://local/external"
+    assert dataset.name == "BAFU-2026 v1_ecoSpold v1.zip"
+
+
+def test_posix_source_identity_keeps_path_out_of_namespace():
+    dataset = external_dataset("file:///data/source_data/BAFU-2026%20v1.zip")
+    assert dataset.namespace == "sentier://local/external"
+    assert dataset.name == "BAFU-2026 v1.zip"
+
+
+def test_relative_source_identity_matches_local_path(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    dataset = external_dataset("file://source_data/input.zip")
+    assert dataset.namespace == "sentier://local/external"
+    assert dataset.name == "input.zip"
+
+
+def test_external_and_emitted_file_have_same_identity(tmp_path):
+    path = tmp_path / "folder with spaces" / "input.zip"
+    assert external_dataset(f"file://{path}") == local_dataset(path)
+    assert external_dataset(path.as_uri()) == local_dataset(path)
 
 
 def _config(tmp_path):
@@ -100,7 +133,12 @@ def test_run_records_parent_and_ordered_child_runs(tmp_path):
 
     output = filter_complete["outputs"][0]
     assert output["facets"]["schema"]["fields"] == [
-        {"name": "keep", "type": "boolean", "ordinal_position": 1}
+        {
+            "name": "keep",
+            "type": "boolean",
+            "ordinal_position": 1,
+            "description": "Examples (sample): true",
+        }
     ]
     assert output["facets"]["sentier_preview"]["rows"] == [{"keep": True}]
     assert output["outputFacets"]["outputStatistics"]["rowCount"] == 1
@@ -131,4 +169,5 @@ def test_failure_records_child_and_parent_fail_events(tmp_path):
     assert [event["eventType"] for event in events[-2:]] == ["FAIL", "FAIL"]
     assert events[-2]["job"]["name"] == "lineage-example.map-rows"
     assert events[-1]["job"]["name"] == "lineage-example"
-    assert events[-1]["run"]["facets"]["errorMessage"]["message"] == "mapping failed"
+    assert events[-1]["run"]["facets"]["errorMessage"]["message"].startswith("RuntimeError:")
+    assert "mapping failed" not in events[-1]["run"]["facets"]["errorMessage"]["message"]

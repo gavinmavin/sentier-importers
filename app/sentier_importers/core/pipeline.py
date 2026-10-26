@@ -1,16 +1,18 @@
 """Pipeline driver: run a source through
 fetch → parse → transform → dedup → assemble → validate → emit → deliver."""
 
+from dataclasses import replace
 from pathlib import Path
 
 from sentier_importers.core import dedup as dedup_mod
 from sentier_importers.core import deliver as deliver_mod
+from sentier_importers.core import inventory_lineage
 from sentier_importers.core import lineage as lineage_mod
 from sentier_importers.core import schema_provider
 from sentier_importers.core import validate as validate_mod
 from sentier_importers.core import write as write_mod
 from sentier_importers.core.context import RunContext
-from sentier_importers.core.errors import FetchError, ValidationError
+from sentier_importers.core.errors import FetchError, SourceContractError, ValidationError
 from sentier_importers.core.registry import DATA_ROOT_VAR
 from sentier_importers.core.source import Source, SourceConfig
 from sentier_importers.core.targets import Target, get_target
@@ -115,54 +117,111 @@ def _produce(
     """
     config = source.config
     target = get_target(config.target)
-    external = [lineage_mod.external_dataset(config.fetch_url)]
-    external.extend(lineage_mod.external_dataset(url) for url in config.inputs.values())
+    external = recorder._inputs
 
-    fetched = lineage_mod.intermediate_dataset(config, "fetched-source")
+    def fetch():
+        raw = _fetch(source, ctx)
+        if isinstance(raw, lineage_mod.RawData):
+            external.append(
+                inventory_lineage.observe_dependency(recorder, "source", config.fetch_url, raw)
+            )
+        return raw
+
+    def observed(stage, allowed=None):
+        def run(operation, inputs):
+            direct_reads = []
+
+            def consume(name, value):
+                if name not in config.inputs or (allowed is not None and name not in allowed):
+                    raise SourceContractError(f"step {stage!r} used undeclared input {name!r}")
+                ref = inventory_lineage.observe_dependency(
+                    recorder, name, config.inputs[name], value
+                )
+                if isinstance(value, Path):
+                    direct_reads.append((value, ref.version))
+                if not any(
+                    item.namespace == ref.namespace and item.name == ref.name for item in inputs
+                ):
+                    inputs.append(ref)
+                if not any(
+                    item.namespace == ref.namespace and item.name == ref.name
+                    for item in recorder._inputs
+                ):
+                    recorder._inputs.append(ref)
+
+            source._input_observer = consume
+            try:
+                result = operation()
+                for path, expected in direct_reads:
+                    if "sha256:" + inventory_lineage.path_fingerprint(path)[0] != expected:
+                        raise SourceContractError(
+                            "Direct input changed while the step was running"
+                        )
+                return result
+            finally:
+                source._input_observer = None
+
+        return run
+
+    fetched = recorder.intermediate("fetched-source")
     raw = recorder.run_child(
         "fetch",
         "Fetch and cache the primary source and its named inputs.",
         external,
         [fetched],
-        lambda: _fetch(source, ctx),
+        fetch,
         source=source.fetch,
     )
 
-    parsed = lineage_mod.intermediate_dataset(config, "parsed-records")
+    parsed = recorder.intermediate("parsed-records")
+    parse_inputs = [fetched]
     records = recorder.run_child(
         "parse",
         f"Parse the fetched {config.fetch_format} source into records.",
-        [fetched],
+        parse_inputs,
         [parsed],
-        lambda: source.parse(raw),
+        lambda: observed("parse")(lambda: source.parse(raw), parse_inputs),
         source=source.parse,
     )
 
     current = parsed
     transformed = records
     for step in source.declared_transform_steps():
-        output = lineage_mod.intermediate_dataset(config, step.name)
+        output = recorder.intermediate(step.name)
+        step_inputs = [current]
         transformed = recorder.run_child(
             step.name,
             step.description,
-            [current],
+            step_inputs,
             [output],
-            lambda step=step, transformed=transformed: step.function(transformed),
+            lambda step=step, transformed=transformed: observed(step.name, step.inputs)(
+                lambda: step.function(transformed), step_inputs
+            ),
             source=step.function,
+            code_dependencies=step.code_dependencies,
+            include_source=True,
         )
         current = output
 
-    deduped = lineage_mod.intermediate_dataset(config, "deduplicated-rows")
+    deduped = recorder.intermediate("deduplicated-rows")
+    dedup_inputs = [current]
+
+    def framework_input(role, url, raw):
+        ref = inventory_lineage.observe_dependency(recorder, role, url, raw)
+        dedup_inputs.append(ref)
+        recorder._inputs.append(ref)
+
+    dedup_ctx = replace(ctx, dependency_observer=framework_input)
     rows = recorder.run_child(
         "deduplicate",
         "Deduplicate transformed rows according to the source registry policy.",
-        [current],
+        dedup_inputs,
         [deduped],
-        lambda: dedup_mod.dedup(transformed, config, target, ctx),
+        lambda: dedup_mod.dedup(transformed, config, target, dedup_ctx),
         source=dedup_mod.dedup,
     )
 
-    assembled = lineage_mod.intermediate_dataset(config, "assembled-payload")
+    assembled = recorder.intermediate("assembled-payload")
     payload = recorder.run_child(
         "assemble",
         "Assemble rows into the payload shape required by the target.",
@@ -172,7 +231,7 @@ def _produce(
         source=_assemble,
     )
 
-    validated = lineage_mod.intermediate_dataset(config, "validated-payload")
+    validated = recorder.intermediate("validated-payload")
 
     def validate() -> Payload:
         _validate(payload, config, target, ctx)
@@ -193,11 +252,9 @@ def validate_source(source: Source, ctx: RunContext) -> int:
     """Run the pipeline up to and including validation; return the row count."""
     config = source.config
     recorder = lineage_mod.LineageRecorder(
-        config, lineage_mod.lineage_path(config, ctx), parent_source=type(source)
+        config, lineage_mod.lineage_path(config, ctx), parent_source=type(source), ctx=ctx
     )
-    inputs = [lineage_mod.external_dataset(config.fetch_url)]
-    inputs.extend(lineage_mod.external_dataset(url) for url in config.inputs.values())
-    recorder.start_parent(inputs)
+    recorder.start_parent([])
     try:
         rows, _, _, validated = _produce(source, ctx, recorder)
         recorder.complete_parent([validated])
@@ -212,6 +269,12 @@ def validate_source(source: Source, ctx: RunContext) -> int:
 def run_source(source: Source, ctx: RunContext) -> Path:
     """Run the full pipeline. Emits to ``output_dir``; delivers a PR unless dry-run."""
     config = source.config
+    archive_lineage = config.target in (
+        "sentier_inventory",
+        "sentier_vocab",
+        "sentier_methods",
+        "sentier_mappings",
+    )
     filename = config.emit_filename or config.name
     out_path = (
         ctx.output_dir
@@ -220,18 +283,18 @@ def run_source(source: Source, ctx: RunContext) -> Path:
         / f"{filename}{write_mod.EXTENSIONS[config.output_format]}"
     )
     recorder = lineage_mod.LineageRecorder(
-        config, lineage_mod.lineage_path(config, ctx), parent_source=type(source)
+        config, lineage_mod.lineage_path(config, ctx), parent_source=type(source), ctx=ctx
     )
-    inputs = [lineage_mod.external_dataset(config.fetch_url)]
-    inputs.extend(lineage_mod.external_dataset(url) for url in config.inputs.values())
-    recorder.start_parent(inputs)
+    recorder.start_parent([])
     try:
         _, payload, target, validated = _produce(source, ctx, recorder)
-        emitted = lineage_mod.local_dataset(out_path)
+        emitted = recorder.artifact(out_path)
 
         def emit() -> Payload:
             arrow_schema = _arrow_schema(config, target, ctx)
             write_mod.write(payload, out_path, config.output_format, arrow_schema)
+            if archive_lineage:
+                recorder.describe_artifact(emitted, out_path)
             return payload
 
         recorder.run_child(
@@ -246,6 +309,11 @@ def run_source(source: Source, ctx: RunContext) -> Path:
         final = emitted
         if ctx.deliver_local_root is not None or not ctx.dry_run:
             target_ref = lineage_mod.target_dataset(config, target.repo, out_path.name)
+            if archive_lineage and ctx.deliver_local_root is not None:
+                local_path = (
+                    ctx.deliver_local_root / target.output_subdir / config.category / out_path.name
+                )
+                target_ref = recorder.artifact(local_path, "delivered")
 
             def deliver() -> Payload:
                 if ctx.deliver_local_root is not None:
@@ -264,6 +332,8 @@ def run_source(source: Source, ctx: RunContext) -> Path:
                         body=f"Automated import of {config.name} by sentier_importers.",
                         ctx=ctx,
                     )
+                if archive_lineage and ctx.deliver_local_root is not None:
+                    recorder.describe_artifact(target_ref, local_path)
                 return payload
 
             recorder.run_child(
@@ -279,6 +349,9 @@ def run_source(source: Source, ctx: RunContext) -> Path:
             final = target_ref
 
         recorder.complete_parent([final])
+        if archive_lineage and ctx.dry_run:
+            artifact = local_path if ctx.deliver_local_root is not None else out_path
+            inventory_lineage.preserve(artifact, recorder, ctx.lineage_store)
         return out_path
     except BaseException as error:
         recorder.fail_parent(error)

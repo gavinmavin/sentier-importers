@@ -10,6 +10,7 @@ import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from sentier_importers.core import fetch as fetch_mod
 from sentier_importers.core import parse as parse_mod
@@ -36,6 +37,8 @@ class TransformStep:
     name: str
     description: str
     function: Callable[[Records], Records]
+    inputs: tuple[str, ...] = ()
+    code_dependencies: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not _STEP_NAME.fullmatch(self.name):
@@ -88,6 +91,31 @@ class SourceConfig:
     # the BAFU EcoSpold export), ``private`` (a DdS-internal artifact). Drives the
     # ``list`` column and the missing-input error message (spec 2026-09-28).
     access: str = "public"
+    # Role -> resolved reusable bibliographic declaration; absent for legacy jobs.
+    input_provenance: dict[str, dict] = field(default_factory=dict)
+
+
+class ObservedInputs(dict):
+    """Report successful named-input reads only while a pipeline step is active."""
+
+    def __init__(self, values, owner):
+        super().__init__(values)
+        self.owner = owner
+
+    def __getitem__(self, name):
+        value = super().__getitem__(name)
+        if self.owner._input_observer is not None:
+            self.owner._input_observer(name, value)
+        return value
+
+    def get(self, name, default=None):
+        return self[name] if name in self else default
+
+    def items(self):
+        return ((name, self[name]) for name in self)
+
+    def values(self):
+        return (self[name] for name in self)
 
 
 class Source(ABC):
@@ -99,8 +127,24 @@ class Source(ABC):
 
     def __init__(self, config: SourceConfig) -> None:
         self.config = config
+        self._input_observer = None
         #: ``config.inputs`` resolved to bytes by :meth:`fetch`, keyed by input name.
         self.inputs: dict[str, RawData] = {}
+
+    @property
+    def inputs(self):
+        return self._inputs
+
+    @inputs.setter
+    def inputs(self, values):
+        self._inputs = ObservedInputs(values, self)
+
+    def input_path(self, name: str) -> Path:
+        """Declare consumption of a configured directory/file read directly by a step."""
+        path = fetch_mod.local_path(self.config.inputs.get(name), name)
+        if self._input_observer is not None:
+            self._input_observer(name, path)
+        return path
 
     def fetch(self, ctx: RunContext) -> RawData:
         """Retrieve raw data (default: cached fetch of ``config.fetch_url``).
@@ -126,13 +170,15 @@ class Source(ABC):
         New and migrated plugins should declare each meaningful operation separately.
         """
         description = self.transform.__doc__ or f"Transform {self.config.name} records."
-        return (TransformStep("transform", description.strip(), self.transform),)
+        return (
+            TransformStep(
+                "transform", description.strip(), self.transform, inputs=tuple(self.config.inputs)
+            ),
+        )
 
     def declared_transform_steps(self) -> tuple[TransformStep, ...]:
-        """Validate and freeze the source's ordered transformation contract."""
+        """Validate and freeze transformations; an empty sequence passes parsed records through."""
         steps = tuple(self.transform_steps())
-        if not steps:
-            raise SourceContractError(f"source {self.config.name!r} declares no transform steps")
         names = [step.name for step in steps]
         duplicates = sorted({name for name in names if names.count(name) > 1})
         if duplicates:
@@ -144,4 +190,10 @@ class Source(ABC):
             raise SourceContractError(
                 f"source {self.config.name!r} uses framework step names: {reserved}"
             )
+        for step in steps:
+            unknown = set(step.inputs) - self.config.inputs.keys()
+            if unknown:
+                raise SourceContractError(
+                    f"step {step.name!r} declares unknown inputs: {sorted(unknown)}"
+                )
         return steps

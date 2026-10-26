@@ -9,10 +9,11 @@ Commands:
 
 import argparse
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from platformdirs import user_cache_dir
-from sentier_importers.core import lineage, pipeline, registry
+from sentier_importers.core import inventory_lineage, lineage, pipeline, registry
 from sentier_importers.core.context import RunContext
 from sentier_importers.core.errors import MissingInputError, SentierImporterError
 
@@ -38,6 +39,8 @@ def _ctx(args: argparse.Namespace) -> RunContext:
             Path(args.deliver_local) if getattr(args, "deliver_local", None) else None
         ),
         lineage_dir=(Path(args.lineage_dir) if getattr(args, "lineage_dir", None) else None),
+        lineage_store=(Path(args.lineage_store) if getattr(args, "lineage_store", None) else None),
+        contributor=getattr(args, "contributor", None),
     )
 
 
@@ -51,6 +54,12 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--cache-dir", default=None, help="Fetch cache directory.")
     parser.add_argument("--output-dir", default=None, help="Where to stage emitted files.")
+    parser.add_argument(
+        "--lineage-store", type=Path, help="Separate local store for immutable lineage bundles."
+    )
+    parser.add_argument(
+        "--contributor", help="Optional public contributor identity recorded in lineage."
+    )
     parser.add_argument("--offline", action="store_true", help="Fail on any fetch cache miss.")
     parser.add_argument(
         "--schema-dir",
@@ -62,6 +71,32 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Write OpenLineage JSONL here (default: <output-dir>/lineage).",
     )
+    parser.add_argument(
+        "--input-file",
+        type=Path,
+        help="Use this local primary input instead of the registry fetch URL (one source only).",
+    )
+    parser.add_argument(
+        "--source-provenance",
+        metavar="DECLARATION",
+        help="Use a source_datasets declaration for the primary input (one source only).",
+    )
+
+
+def _configured(config, args):
+    if getattr(args, "input_file", None) is not None:
+        config = replace(config, fetch_url=f"file://{args.input_file.expanduser().resolve()}")
+    if getattr(args, "source_provenance", None):
+        provenance = {
+            **config.input_provenance,
+            **registry.source_provenance(args.source_provenance),
+        }
+        if set(config.inputs) - provenance.keys():
+            raise SentierImporterError(
+                "Declare provenance for secondary inputs in the registry first"
+            )
+        config = replace(config, input_provenance=provenance)
+    return config
 
 
 def cmd_list(args: argparse.Namespace) -> None:
@@ -82,7 +117,7 @@ def _warn_skipped(exc: MissingInputError, name: str) -> None:
 
 
 def cmd_validate(args: argparse.Namespace) -> None:
-    config = registry.get_config(args.source, data_root=_data_root(args))
+    config = _configured(registry.get_config(args.source, data_root=_data_root(args)), args)
     source = registry.load_source(config)
     ctx = _ctx(args)
     try:
@@ -97,12 +132,17 @@ def cmd_validate(args: argparse.Namespace) -> None:
 def cmd_run(args: argparse.Namespace) -> None:
     ctx = _ctx(args)
     if args.all:
+        if args.input_file or args.source_provenance:
+            raise SentierImporterError(
+                "--input-file and --source-provenance require a single source"
+            )
         configs = [c for c in registry.load_registry(data_root=ctx.data_root) if c.enabled]
     else:
         if not args.source:
             raise SentierImporterError("run requires a <source> name or --all")
         configs = [registry.get_config(args.source, data_root=ctx.data_root)]
     for config in configs:
+        config = _configured(config, args)
         try:
             out = pipeline.run_source(registry.load_source(config), ctx)
         except MissingInputError as exc:
@@ -137,6 +177,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_common(run)
     run.set_defaults(func=cmd_run)
+
+    inspection = sub.add_parser(
+        "inspect-lineage", help="Inspect a recorded local artifact in Marquez."
+    )
+    inventory_lineage.add_arguments(inspection)
+    inspection.set_defaults(func=inventory_lineage.command)
 
     return parser
 

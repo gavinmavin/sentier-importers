@@ -2,19 +2,18 @@
 
 from __future__ import annotations
 
-import inspect
+import hashlib
 import json
-import subprocess
 import traceback
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timezone
-from functools import lru_cache
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, TypeVar
-from urllib.parse import unquote, urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit
 
+from sentier_importers.core import code_metadata
 from sentier_importers.core.context import RunContext
 from sentier_importers.core.source import SourceConfig
 from sentier_importers.core.types import RawData
@@ -24,9 +23,6 @@ RUN_EVENT_SCHEMA = "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/Ru
 PARENT_FACET_SCHEMA = "https://openlineage.io/spec/facets/1-0-0/ParentRunFacet.json"
 DOCUMENTATION_FACET_SCHEMA = "https://openlineage.io/spec/facets/1-0-0/DocumentationJobFacet.json"
 ERROR_FACET_SCHEMA = "https://openlineage.io/spec/facets/1-0-0/ErrorMessageRunFacet.json"
-SOURCE_LOCATION_FACET_SCHEMA = (
-    "https://openlineage.io/spec/facets/1-1-0/SourceCodeLocationJobFacet.json"
-)
 SCHEMA_FACET_SCHEMA = "https://openlineage.io/spec/facets/1-2-0/SchemaDatasetFacet.json"
 INPUT_STATISTICS_FACET_SCHEMA = (
     "https://openlineage.io/spec/facets/1-0-0/InputStatisticsInputDatasetFacet.json"
@@ -34,13 +30,17 @@ INPUT_STATISTICS_FACET_SCHEMA = (
 OUTPUT_STATISTICS_FACET_SCHEMA = (
     "https://openlineage.io/spec/facets/1-0-2/OutputStatisticsOutputDatasetFacet.json"
 )
+DATASET_DOCUMENTATION_SCHEMA = (
+    "https://openlineage.io/spec/facets/1-0-0/DocumentationDatasetFacet.json"
+)
+DATASET_VERSION_SCHEMA = "https://openlineage.io/spec/facets/1-0-1/DatasetVersionDatasetFacet.json"
 SENTIER_FACET_ROOT = (
     "https://raw.githubusercontent.com/sentier-dev/sentier-importers/"
     "main/openlineage/facets/1-0-0"
 )
 PREVIEW_FACET_SCHEMA = f"{SENTIER_FACET_ROOT}/SentierPreviewDatasetFacet.json"
 TRANSFORMATION_FACET_SCHEMA = f"{SENTIER_FACET_ROOT}/SentierTransformationRunFacet.json"
-REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+EXECUTION_FACET_SCHEMA = f"{SENTIER_FACET_ROOT}/SentierExecutionRunFacet.json"
 
 T = TypeVar("T")
 
@@ -52,6 +52,7 @@ class DatasetSnapshot:
     row_count: int
     fields: tuple[dict[str, object], ...]
     preview: tuple[dict[str, object], ...]
+    json_encoded_columns: tuple[str, ...] = ()
 
     @property
     def columns(self) -> set[str]:
@@ -65,28 +66,74 @@ class DatasetRef:
     namespace: str
     name: str
     snapshot: DatasetSnapshot | None = field(default=None, repr=False)
+    description: str | None = None
+    version: str | None = None
+    provenance: dict | None = None
+    source_metadata: dict | None = None
 
     def capture(self, value: object) -> None:
         self.snapshot = _snapshot(value)
 
     def as_event_value(self, *, role: str | None = None) -> dict[str, object]:
         value: dict[str, object] = {"namespace": self.namespace, "name": self.name}
+        facets: dict[str, object] = {}
+        if self.description:
+            facets["documentation"] = {
+                "_producer": PRODUCER,
+                "_schemaURL": DATASET_DOCUMENTATION_SCHEMA,
+                "description": self.description,
+            }
+        if self.version:
+            facets["version"] = {
+                "_producer": PRODUCER,
+                "_schemaURL": DATASET_VERSION_SCHEMA,
+                "datasetVersion": self.version,
+            }
+        if self.provenance:
+            facets["sentier_provenance"] = {
+                "_producer": PRODUCER,
+                "_schemaURL": f"{SENTIER_FACET_ROOT}/SentierProvenanceDatasetFacet.json",
+                **self.provenance,
+            }
+        if self.source_metadata:
+            facets["sentier_source"] = {
+                "_producer": PRODUCER,
+                "_schemaURL": f"{SENTIER_FACET_ROOT}/SentierSourceDatasetFacet.json",
+                **self.source_metadata,
+            }
+            metadata = self.source_metadata["metadata"]
+            if metadata.get("source_url"):
+                facets["dataSource"] = {
+                    "_producer": PRODUCER,
+                    "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/DatasourceDatasetFacet.json",
+                    "name": metadata["source"],
+                    "uri": metadata["source_url"],
+                }
+        if facets:
+            value["facets"] = facets
         if self.snapshot is None:
             return value
-        value["facets"] = {
-            "schema": {
-                "_producer": PRODUCER,
-                "_schemaURL": SCHEMA_FACET_SCHEMA,
-                "fields": list(self.snapshot.fields),
-            },
-            "sentier_preview": {
-                "_producer": PRODUCER,
-                "_schemaURL": PREVIEW_FACET_SCHEMA,
-                "rows": list(self.snapshot.preview),
-                "rowCount": self.snapshot.row_count,
-                "truncated": self.snapshot.row_count > len(self.snapshot.preview),
-            },
-        }
+        facets.update(
+            {
+                "schema": {
+                    "_producer": PRODUCER,
+                    "_schemaURL": SCHEMA_FACET_SCHEMA,
+                    "fields": list(self.snapshot.fields),
+                },
+                "sentier_preview": {
+                    "_producer": PRODUCER,
+                    "_schemaURL": PREVIEW_FACET_SCHEMA,
+                    "rows": list(self.snapshot.preview),
+                    "rowCount": self.snapshot.row_count,
+                    "truncated": self.snapshot.row_count > len(self.snapshot.preview),
+                },
+            }
+        )
+        value["facets"] = facets
+        if self.snapshot.json_encoded_columns:
+            facets["sentier_preview"]["jsonEncodedColumns"] = list(
+                self.snapshot.json_encoded_columns
+            )
         if role == "input":
             value["inputFacets"] = {
                 "inputStatistics": {
@@ -114,20 +161,37 @@ def lineage_path(config: SourceConfig, ctx: RunContext) -> Path:
 
 def external_dataset(url: str) -> DatasetRef:
     """Split an input URL into an OpenLineage namespace and dataset name."""
+    if url.startswith("file://"):
+        # Registry file URLs also accept native paths (file://C:\\... and
+        # file://../...). Split those as filesystem paths, rather than treating
+        # the Windows drive and backslashes as a URL authority.
+        local = unquote(url[len("file://") :]).replace("\\", "/")
+        windows = PureWindowsPath(local.lstrip("/"))
+        if windows.drive.endswith(":") and windows.is_absolute():
+            path = windows
+        elif local.startswith("/"):
+            path = PurePosixPath(local)
+        else:
+            path = Path(local).resolve()
+        return DatasetRef("sentier://local/external", path.name)
     parsed = urlsplit(url)
     path = PurePosixPath(unquote(parsed.path))
     name = path.name or "source"
-    namespace = urlunsplit((parsed.scheme, parsed.netloc, str(path.parent), "", ""))
+    namespace = (
+        "sentier://remote/external"
+        if parsed.scheme in ("https", "http")
+        else "sentier://external/static"
+    )
     return DatasetRef(namespace or url, name)
 
 
-def intermediate_dataset(config: SourceConfig, name: str) -> DatasetRef:
-    return DatasetRef(f"inmemory://sentier-importers/{config.name}", name)
+def intermediate_dataset(config: SourceConfig, name: str, run_id: str = "working") -> DatasetRef:
+    return DatasetRef(f"inmemory://sentier-importers/{config.name}/{run_id}", name)
 
 
 def local_dataset(path: Path) -> DatasetRef:
     resolved = path.resolve()
-    return DatasetRef(resolved.parent.as_uri(), resolved.name)
+    return DatasetRef("sentier://local/external", resolved.name)
 
 
 def target_dataset(config: SourceConfig, repo: str, filename: str) -> DatasetRef:
@@ -136,6 +200,14 @@ def target_dataset(config: SourceConfig, repo: str, filename: str) -> DatasetRef
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _json_value(value: object) -> object:
@@ -209,59 +281,47 @@ def _snapshot(value: object) -> DatasetSnapshot | None:
             text = str(name)
             if text not in names:
                 names.append(text)
-    fields = tuple(
-        {
+    fields = []
+    for index, name in enumerate(names, start=1):
+        examples = []
+        keys = set()
+        for row in rows:
+            value = row.get(name)
+            if value is None:
+                continue
+            key = json.dumps(_json_value(value), sort_keys=True, ensure_ascii=False, default=str)
+            if key not in keys:
+                keys.add(key)
+                examples.append(key if len(key) <= 120 else key[:117] + "...")
+                if len(examples) == 3:
+                    break
+        field = {
             "name": name,
             "type": _type_name([row.get(name) for row in rows]),
             "ordinal_position": index,
         }
-        for index, name in enumerate(names, start=1)
+        if examples:
+            field["description"] = "Examples (sample): " + "; ".join(examples)
+        fields.append(field)
+    # Marquez indexes preview columns across datasets. Inventory's scalar source
+    # and randonneur's object source otherwise conflict in its existing index.
+    encoded = tuple(
+        name
+        for name in names
+        if name in {"source", "target"} and any(isinstance(row.get(name), Mapping) for row in rows)
     )
-    preview = tuple({str(key): _json_value(item) for key, item in row.items()} for row in rows[:5])
-    return DatasetSnapshot(len(rows), fields, preview)
-
-
-@lru_cache(maxsize=None)
-def _git_value(*arguments: str) -> str | None:
-    try:
-        result = subprocess.run(
-            ["git", *arguments],
-            cwd=REPOSITORY_ROOT,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except (OSError, subprocess.CalledProcessError):
-        return None
-    return result.stdout.strip() or None
-
-
-def _source_code_location(source: object | None) -> dict[str, object] | None:
-    if source is None:
-        return None
-    try:
-        source = inspect.unwrap(source)
-        filename = Path(inspect.getsourcefile(source) or inspect.getfile(source)).resolve()
-        line = inspect.getsourcelines(source)[1]
-        relative = filename.relative_to(REPOSITORY_ROOT).as_posix()
-    except (OSError, TypeError, ValueError):
-        return None
-    branch = _git_value("branch", "--show-current") or "main"
-    version = _git_value("rev-parse", "HEAD")
-    dirty = bool(_git_value("status", "--porcelain", "--untracked-files=all"))
-    revision = branch if dirty or version is None else version
-    facet: dict[str, object] = {
-        "_producer": PRODUCER,
-        "_schemaURL": SOURCE_LOCATION_FACET_SCHEMA,
-        "type": "git",
-        "url": f"{PRODUCER}/blob/{revision}/{relative}#L{line}",
-        "repoUrl": f"{PRODUCER}.git",
-        "path": relative,
-        "branch": branch,
-    }
-    if version and not dirty:
-        facet["version"] = version
-    return facet
+    preview = tuple(
+        {
+            str(key): (
+                json.dumps(_json_value(item), ensure_ascii=False, sort_keys=True)
+                if key in encoded and isinstance(item, Mapping)
+                else _json_value(item)
+            )
+            for key, item in row.items()
+        }
+        for row in rows[:5]
+    )
+    return DatasetSnapshot(len(rows), tuple(fields), preview, encoded)
 
 
 def _transformation_facet(
@@ -290,7 +350,11 @@ class LineageRecorder:
     """Write a parent import run and its direct child step runs as JSONL."""
 
     def __init__(
-        self, config: SourceConfig, path: Path, parent_source: object | None = None
+        self,
+        config: SourceConfig,
+        path: Path,
+        parent_source: object | None = None,
+        ctx: RunContext | None = None,
     ) -> None:
         self.config = config
         self.path = path
@@ -298,11 +362,50 @@ class LineageRecorder:
         self.parent_run_id = str(uuid.uuid4())
         self.parent_job_name = config.name
         self._inputs: list[DatasetRef] = []
+        self.started_at = _now()
+        self.execution = {
+            "_producer": PRODUCER,
+            "_schemaURL": EXECUTION_FACET_SCHEMA,
+            "startedAt": self.started_at,
+        }
+        if ctx and ctx.contributor:
+            self.execution["contributor"] = ctx.contributor
+        scope_file = (ctx.output_dir if ctx else path.parent) / ".lineage" / "workspace-id"
+        scope_file.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with scope_file.open("x", encoding="utf-8") as scope:
+                scope.write(uuid.uuid4().hex)
+        except FileExistsError:
+            pass
+        self.workspace_id = scope_file.read_text(encoding="utf-8").strip()
+        if not self.workspace_id or any(c not in "0123456789abcdef" for c in self.workspace_id):
+            raise ValueError("Invalid opaque lineage workspace identifier")
+        self.dependencies = {}
+        self._code = {}
         path.parent.mkdir(parents=True, exist_ok=True)
         self._stream = path.open("w", encoding="utf-8", newline="\n")
 
     def close(self) -> None:
         self._stream.close()
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+    def artifact(self, path: Path, location="staged") -> DatasetRef:
+        return DatasetRef(
+            f"sentier://local/{self.workspace_id}/{self.config.target.replace('_', '-')}/"
+            f"{self.config.category}/{location}/run/{self.parent_run_id}",
+            path.name,
+        )
+
+    def intermediate(self, name: str) -> DatasetRef:
+        return intermediate_dataset(self.config, name, self.parent_run_id)
+
+    def describe_artifact(self, dataset: DatasetRef, path: Path) -> None:
+        digest = file_sha256(path)
+        dataset.version = f"sha256:{digest}"
+        dataset.namespace += f"/sha256/{digest}"
+        dataset.description = f"{self.config.category}: {path.stem.replace('-', ' ')}."
 
     def start_parent(self, inputs: Sequence[DatasetRef]) -> None:
         self._inputs = list(inputs)
@@ -342,11 +445,14 @@ class LineageRecorder:
         operation: Callable[[], T],
         *,
         source: object | None = None,
+        code_dependencies: tuple[str, ...] = (),
+        include_source: bool = False,
     ) -> T:
         """Run ``operation`` between a child START and terminal event."""
         run_id = str(uuid.uuid4())
         job_name = f"{self.config.name}.{name}"
         source = source or operation
+        self._code[job_name] = code_metadata.capture(source, code_dependencies, include_source)
         self._write(
             event_type="START",
             run_id=run_id,
@@ -399,7 +505,7 @@ class LineageRecorder:
         child: bool = False,
         error: BaseException | None = None,
     ) -> None:
-        run_facets: dict[str, object] = {}
+        run_facets: dict[str, object] = {"sentier_execution": self.execution}
         if child:
             run_facets["parent"] = {
                 "_producer": PRODUCER,
@@ -414,10 +520,11 @@ class LineageRecorder:
             run_facets["errorMessage"] = {
                 "_producer": PRODUCER,
                 "_schemaURL": ERROR_FACET_SCHEMA,
-                "message": str(error),
+                "message": f"{type(error).__name__}: step failed; see local execution logs",
                 "programmingLanguage": "python",
-                "stackTrace": "".join(
-                    traceback.format_exception(type(error), error, error.__traceback__)
+                "stackTrace": "\n".join(
+                    f"{frame.name}: line {frame.lineno}"
+                    for frame in traceback.extract_tb(error.__traceback__)
                 ),
             }
         job_facets: dict[str, object] = {
@@ -427,9 +534,9 @@ class LineageRecorder:
                 "description": description,
             }
         }
-        source_location = _source_code_location(source)
-        if source_location is not None:
-            job_facets["sourceCodeLocation"] = source_location
+        if job_name not in self._code:
+            self._code[job_name] = code_metadata.capture(source)
+        job_facets.update(self._code[job_name])
         event = {
             "eventTime": _now(),
             "eventType": event_type,

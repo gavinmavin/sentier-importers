@@ -30,4 +30,10 @@ class RunContext:
     schema_dir: Path | None = None
     deliver_local_root: Path | None = None
     data_root: Path | None = None
+    # Working JSONL location; bundles are archived independently.
     lineage_dir: Path | None = None
+    # Optional separate archive; adjacent pointers provide discovery.
+    lineage_store: Path | None = None
+    # Only an explicitly supplied public identity is recorded.
+    contributor: str | None = None
+    dependency_observer: object | None = None

@@ -35,9 +35,10 @@ class BafuInventoryProcessesSource(Source):
             TransformStep(
                 name="map-process-rows",
                 description=(
-                    "Map all BAFU process records to Sentier inventory rows with source and sector."
+                    "Map BAFU process records to inventory rows with source and sector."
                 ),
                 function=self._map_process_rows,
+                code_dependencies=("app/sentier_importers/sources/bafu/ecospold.py",),
             ),
         )
 
