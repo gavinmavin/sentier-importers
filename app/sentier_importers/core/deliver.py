@@ -9,8 +9,9 @@ source rewrites its own folder whole, and sources never share a folder or a file
 
 import shutil
 import subprocess
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
+from sentier_importers.core import inventory_lineage
 from sentier_importers.core.context import RunContext
 from sentier_importers.core.errors import DeliveryError
 from sentier_importers.core.targets import Target
@@ -31,13 +32,28 @@ def _remove_stale_same_stem(dest: Path) -> None:
     for sibling in dest.parent.glob(f"{dest.stem}.*"):
         if sibling.name != dest.name:
             sibling.unlink()
+            pointer = dest.parent / ".lineage" / f"{sibling.name}.json"
+            if pointer.is_file():
+                pointer.unlink()
+
+
+def _destination(root, target, category):
+    for value in (target.output_subdir, category):
+        path = PurePosixPath(value)
+        if path.is_absolute() or ".." in path.parts or "\\" in value or ":" in value:
+            raise DeliveryError("Delivery folders must be portable repository-relative paths")
+    root = root.resolve()
+    destination = (root / target.output_subdir / category).resolve()
+    if not destination.is_relative_to(root):
+        raise DeliveryError("Delivery folder escapes its repository")
+    return destination
 
 
 def deliver_local(files: list[Path], target: Target, *, category: str, root: Path) -> list[Path]:
     """Copy emitted ``files`` into a local checkout of ``target`` — no git, no PR.
 
     Places each file at ``root/<output_subdir>/<category>/<name>``, preserving the
-    category folder (unlike :func:`deliver`, which currently flattens). This is the
+    category folder. This is the
     regenerate-locally delivery path for sources whose data cannot be pushed to a
     public repo yet; ``root`` must be an existing directory. Existing files at the
     destination are overwritten: for inventory targets the category is the source
@@ -45,7 +61,7 @@ def deliver_local(files: list[Path], target: Target, *, category: str, root: Pat
     """
     if not root.is_dir():
         raise DeliveryError(f"local delivery root is not a directory: {root}")
-    dest_dir = root / target.output_subdir / category
+    dest_dir = _destination(root, target, category)
     dest_dir.mkdir(parents=True, exist_ok=True)
     dests: list[Path] = []
     for file in files:
@@ -64,17 +80,32 @@ def deliver(
     title: str,
     body: str,
     ctx: RunContext,
+    category: str = "",
+    with_lineage: bool = False,
 ) -> str | None:
     """Open a PR adding ``files`` to ``target``. Returns the PR URL, or None in dry-run.
 
     In dry-run mode this performs no git/gh operations. Otherwise it clones the
     target into a working dir under the cache, creates ``branch``, copies the files
-    into ``target.output_subdir``, commits, pushes, and runs ``gh pr create``.
+    into ``target.output_subdir/category``. With lineage, it also exports portable
+    pointers, immutable bundles and byte-preserving attributes into the same commit,
+    then pushes and runs ``gh pr create``.
     """
     if ctx.dry_run:
         return None
 
-    workdir = ctx.cache_dir / "delivery" / target.name
+    cache_root = ctx.cache_dir.resolve()
+    delivery_root = (cache_root / "delivery").resolve()
+    if not delivery_root.is_relative_to(cache_root):
+        raise DeliveryError("Delivery checkout root escapes its cache")
+    workdir = (delivery_root / target.name).resolve()
+    if workdir.parent != delivery_root:
+        raise DeliveryError("Delivery checkout must be a direct child of the delivery cache")
+    _destination(workdir, target, category)  # Validate before touching the checkout.
+    if with_lineage:
+        for file in files:
+            if inventory_lineage.read_bundle(file) is None:
+                raise DeliveryError(f"No completed lineage bundle for {file.name}")
     try:
         if workdir.exists():
             shutil.rmtree(workdir)
@@ -82,14 +113,27 @@ def deliver(
         _run(["git", "clone", "--depth", "1", target.repo, str(workdir)])
         _run(["git", "checkout", "-b", branch], cwd=workdir)
 
-        dest_dir = workdir / target.output_subdir
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        for file in files:
-            dest = dest_dir / file.name
-            _remove_stale_same_stem(dest)
-            shutil.copy2(file, dest)
+        destinations = deliver_local(files, target, category=category, root=workdir)
+        lineage_paths = []
+        if with_lineage:
+            for source, destination in zip(files, destinations):
+                lineage_paths.extend(inventory_lineage.export_bundle(source, destination, workdir))
 
-        _run(["git", "add", target.output_subdir], cwd=workdir)
+        _run(["git", "add", "--", target.output_subdir], cwd=workdir)
+        if lineage_paths:
+            # Force only the verified bundle/pointer paths if a target ignores
+            # generated lineage globally; never force-add the contributor's store.
+            _run(
+                [
+                    "git",
+                    "add",
+                    "-f",
+                    "--",
+                    ".gitattributes",
+                    *[path.relative_to(workdir).as_posix() for path in lineage_paths],
+                ],
+                cwd=workdir,
+            )
         _run(["git", "commit", "-m", title], cwd=workdir)
         _run(["git", "push", "-u", "origin", branch], cwd=workdir)
         url = _run(["gh", "pr", "create", "--title", title, "--body", body], cwd=workdir)

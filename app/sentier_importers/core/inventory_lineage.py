@@ -109,7 +109,7 @@ def _write_archive(folder, snapshot):
     manifest = copy.deepcopy(snapshot["manifest"])
     for child in snapshot["children"]:
         child_id = child["manifest"]["runId"]
-        _write_archive(folder / "upstream" / child_id, child)
+        _write_archive(_contained(folder / "upstream", child_id), child)
     (folder / "events.jsonl").write_text(
         "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in snapshot["events"]),
         encoding="utf-8",
@@ -175,6 +175,63 @@ def preserve(artifact, recorder, store=None):
             "manifest": f"{recorder.parent_run_id}/manifest.json",
         },
     )
+
+
+def export_bundle(source, destination, repository_root):
+    """Copy verified history into a portable, versioned target-repository layout.
+
+    The destination artifact must already contain the same bytes. Original import
+    identities are retained; this does not assert that a PR has been merged.
+    """
+    source, destination = Path(source), Path(destination)
+    root = Path(repository_root).resolve()
+    if not destination.resolve().is_relative_to(root):
+        raise SentierImporterError("Delivered artifact escapes its repository")
+    snapshot = _bundle_snapshot(source)
+    if snapshot is None:
+        raise SentierImporterError(f"No lineage bundle available for {source.name}")
+    manifest = snapshot["manifest"]
+    if destination.name != manifest["artifact"] or file_sha256(destination) != manifest["sha256"]:
+        raise SentierImporterError("Delivered artifact differs from its lineage bundle")
+    store = _contained(root, "lineage/runs")
+    folder = _contained(store, manifest["runId"])
+    if (folder / "manifest.json").exists():
+        existing = _load_archive(folder / "manifest.json")
+        if existing != snapshot:
+            raise SentierImporterError("Conflicting existing lineage run; history is immutable")
+    elif folder.exists():
+        raise SentierImporterError("Existing lineage run folder is incomplete")
+    else:
+        _write_archive(folder, snapshot)
+    pointer = _contained(root, str(destination.parent / ".lineage" / f"{destination.name}.json"))
+    pointer.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        pointer,
+        {
+            "store": Path(os.path.relpath(store, pointer.parent)).as_posix(),
+            "manifest": f"{manifest['runId']}/manifest.json",
+        },
+    )
+    _preserve_git_bytes(root, destination, pointer)
+    _bundle_snapshot(destination)  # Verify the exported pointer and entire archive.
+    return pointer, folder
+
+
+def _preserve_git_bytes(root, artifact, pointer):
+    """Git checkout newline conversion must not invalidate recorded checksums."""
+    attributes = _contained(root, ".gitattributes")
+    text = attributes.read_text(encoding="utf-8") if attributes.exists() else ""
+    rules = [
+        json.dumps("/" + path.resolve().relative_to(root).as_posix(), ensure_ascii=False)
+        + " -text"
+        for path in (artifact, pointer)
+    ] + ["/lineage/runs/** -text"]
+    missing = [rule for rule in rules if rule not in text.splitlines()]
+    if missing:
+        if text and not text.endswith("\n"):
+            text += "\n"
+        text += "\n".join(missing) + "\n"
+        attributes.write_text(text, encoding="utf-8", newline="\n")
 
 
 def local_input_path(url):
@@ -270,7 +327,7 @@ def positive_depth(value):
     return depth
 
 
-def inspect_inventory(source, endpoint, inventory_root, api_url, web_url, depth=8):
+def inspect_inventory(source, endpoint, inventory_root, api_url, web_url, depth=8, *, upload=True):
     if not isinstance(depth, int) or depth < 1:
         raise SentierImporterError("Depth must be a positive integer")
     if Path(source).name != source or source in (".", "..") or "/" in source or "\\" in source:
@@ -278,11 +335,11 @@ def inspect_inventory(source, endpoint, inventory_root, api_url, web_url, depth=
     data_root = inventory_root / "data" if (inventory_root / "data").is_dir() else inventory_root
     artifact = data_root / source / f"{endpoint}.parquet"
     return inspect_artifact(
-        artifact, api_url, web_url, depth, label=f"{source}/{endpoint}.parquet"
+        artifact, api_url, web_url, depth, label=f"{source}/{endpoint}.parquet", upload=upload
     )
 
 
-def inspect_artifact(artifact, api_url, web_url, depth=8, *, label=None):
+def inspect_artifact(artifact, api_url, web_url, depth=8, *, label=None, upload=True):
     """Inspect a recorded local output without repository-specific endpoint rules."""
     if not isinstance(depth, int) or depth < 1:
         raise SentierImporterError("Depth must be a positive integer")
@@ -306,13 +363,12 @@ def inspect_artifact(artifact, api_url, web_url, depth=8, *, label=None):
         ordered.extend(bundle["events"])
 
     visit(snapshot)
-    for address in (api_url, web_url):
-        if urlsplit(address).scheme not in ("http", "https"):
-            raise SentierImporterError("Marquez addresses must use http:// or https://")
+    api_url, web_url = _marquez_base(api_url), _marquez_base(web_url)
     try:
         with httpx.Client(base_url=api_url.rstrip("/"), timeout=60, trust_env=False) as client:
-            for event in ordered:
-                client.post("/api/v1/lineage", json=event).raise_for_status()
+            if upload:
+                for event in ordered:
+                    client.post("/api/v1/lineage", json=event).raise_for_status()
             dataset = snapshot["manifest"]["dataset"]
             response = client.get(
                 "/api/v1/lineage",
@@ -321,8 +377,16 @@ def inspect_artifact(artifact, api_url, web_url, depth=8, *, label=None):
                     "depth": depth,
                 },
             )
+            if not upload and response.status_code == 404:
+                raise SentierImporterError(
+                    "This artifact's lineage is not indexed on that Marquez server"
+                )
             response.raise_for_status()
             if not response.json().get("graph"):
+                if not upload:
+                    raise SentierImporterError(
+                        "This artifact's lineage is not indexed on that Marquez server"
+                    )
                 raise SentierImporterError(
                     "Marquez accepted the events but returned an empty graph"
                 )
@@ -344,6 +408,26 @@ def inspect_artifact(artifact, api_url, web_url, depth=8, *, label=None):
     return url
 
 
+def _marquez_base(address):
+    address = address.strip().rstrip("/")
+    parts = urlsplit(address)
+    if (
+        parts.scheme not in ("http", "https")
+        or not parts.netloc
+        or parts.username
+        or parts.password
+        or parts.query
+        or parts.fragment
+    ):
+        raise SentierImporterError(
+            "Marquez addresses must be http(s) base URLs without credentials or query strings"
+        )
+    # Accept a pasted API base as well as the shared service origin.
+    if address.endswith("/api/v1"):
+        address = address[: -len("/api/v1")]
+    return address
+
+
 def add_arguments(parser):
     parser.add_argument("source", nargs="?", help="Inventory source folder, e.g. bafu-2026-v1")
     endpoints = parser.add_mutually_exclusive_group(required=True)
@@ -360,27 +444,40 @@ def add_arguments(parser):
         default=Path(__file__).resolve().parents[4] / "sentier-inventory",
         help="Inventory checkout or staging directory",
     )
-    parser.add_argument("--marquez-api", default="http://localhost:5000")
-    parser.add_argument("--marquez-web", default="http://localhost:3000")
+    parser.add_argument(
+        "--marquez-url", help="Common Marquez API/UI base URL, e.g. https://lineage.example.org"
+    )
+    parser.add_argument("--marquez-api", help="Separate API base URL (overrides --marquez-url)")
+    parser.add_argument("--marquez-web", help="Separate UI base URL (overrides --marquez-url)")
+    parser.add_argument(
+        "--no-upload",
+        action="store_true",
+        help="Query existing server lineage without submitting events (public/read-only servers).",
+    )
     parser.add_argument("--depth", type=positive_depth, default=8)
 
 
 def command(args):
+    common = getattr(args, "marquez_url", None)
+    api_url = args.marquez_api or common or "http://localhost:5000"
+    web_url = args.marquez_web or common or "http://localhost:3000"
+    upload = not getattr(args, "no_upload", False)
     if args.artifact is not None:
         if args.source is not None:
             raise SentierImporterError(
                 "Use --artifact by itself, or select an inventory source and endpoint"
             )
-        return inspect_artifact(args.artifact, args.marquez_api, args.marquez_web, args.depth)
+        return inspect_artifact(args.artifact, api_url, web_url, args.depth, upload=upload)
     if args.source is None:
         raise SentierImporterError("An inventory endpoint requires a source folder")
     inspect_inventory(
         args.source,
         args.endpoint,
         args.inventory_root,
-        args.marquez_api,
-        args.marquez_web,
+        api_url,
+        web_url,
         args.depth,
+        upload=upload,
     )
 
 

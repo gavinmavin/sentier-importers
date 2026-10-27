@@ -286,6 +286,7 @@ def run_source(source: Source, ctx: RunContext) -> Path:
         config, lineage_mod.lineage_path(config, ctx), parent_source=type(source), ctx=ctx
     )
     recorder.start_parent([])
+    completed = False
     try:
         _, payload, target, validated = _produce(source, ctx, recorder)
         emitted = recorder.artifact(out_path)
@@ -307,32 +308,19 @@ def run_source(source: Source, ctx: RunContext) -> Path:
         )
 
         final = emitted
-        if ctx.deliver_local_root is not None or not ctx.dry_run:
+        if ctx.deliver_local_root is not None:
+            local_path = (
+                ctx.deliver_local_root / target.output_subdir / config.category / out_path.name
+            )
             target_ref = lineage_mod.target_dataset(config, target.repo, out_path.name)
-            if archive_lineage and ctx.deliver_local_root is not None:
-                local_path = (
-                    ctx.deliver_local_root / target.output_subdir / config.category / out_path.name
-                )
+            if archive_lineage:
                 target_ref = recorder.artifact(local_path, "delivered")
 
             def deliver() -> Payload:
-                if ctx.deliver_local_root is not None:
-                    deliver_mod.deliver_local(
-                        [out_path],
-                        target,
-                        category=config.category,
-                        root=ctx.deliver_local_root,
-                    )
-                if not ctx.dry_run:
-                    deliver_mod.deliver(
-                        [out_path],
-                        target,
-                        branch=f"import/{config.name}",
-                        title=f"Import {config.name}",
-                        body=f"Automated import of {config.name} by sentier_importers.",
-                        ctx=ctx,
-                    )
-                if archive_lineage and ctx.deliver_local_root is not None:
+                deliver_mod.deliver_local(
+                    [out_path], target, category=config.category, root=ctx.deliver_local_root
+                )
+                if archive_lineage:
                     recorder.describe_artifact(target_ref, local_path)
                 return payload
 
@@ -342,19 +330,33 @@ def run_source(source: Source, ctx: RunContext) -> Path:
                 [emitted],
                 [target_ref],
                 deliver,
-                source=(
-                    deliver_mod.deliver_local if ctx.deliver_local_root else deliver_mod.deliver
-                ),
+                source=deliver_mod.deliver_local,
             )
             final = target_ref
 
         recorder.complete_parent([final])
-        if archive_lineage and ctx.dry_run:
-            artifact = local_path if ctx.deliver_local_root is not None else out_path
-            inventory_lineage.preserve(artifact, recorder, ctx.lineage_store)
-        return out_path
+        completed = True
+        if archive_lineage:
+            inventory_lineage.preserve(out_path, recorder, ctx.lineage_store)
+            if ctx.deliver_local_root is not None:
+                inventory_lineage.export_bundle(out_path, local_path, ctx.deliver_local_root)
     except BaseException as error:
-        recorder.fail_parent(error)
+        if not completed:
+            recorder.fail_parent(error)
         raise
     finally:
         recorder.close()
+    # A PR packages a completed import. A Git/PR failure must not rewrite that
+    # successful history as an import failure or claim publication on main.
+    if not ctx.dry_run:
+        deliver_mod.deliver(
+            [out_path],
+            target,
+            category=config.category,
+            with_lineage=archive_lineage,
+            branch=f"import/{config.name}",
+            title=f"Import {config.name}",
+            body=f"Automated import of {config.name} by sentier_importers.",
+            ctx=ctx,
+        )
+    return out_path

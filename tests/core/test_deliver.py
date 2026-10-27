@@ -36,6 +36,8 @@ def test_real_run_invokes_git_and_gh(tmp_path, monkeypatch):
 
     def fake_run(cmd, cwd=None):
         calls.append(cmd)
+        if cmd[:2] == ["git", "clone"]:
+            src.__class__(cmd[-1]).mkdir(parents=True)
         if cmd[:2] == ["gh", "pr"]:
             return "https://github.com/o/r/pull/1\n"
         return ""

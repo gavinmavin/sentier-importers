@@ -43,6 +43,12 @@ def run_inventory(tmp_path, name="processes", local=True):
     return root, artifact, ctx, config
 
 
+def bundle_directory(artifact):
+    pointer = artifact.parent / ".lineage" / f"{artifact.name}.json"
+    index = json.loads(pointer.read_text())
+    return (pointer.parent / index["store"] / index["manifest"]).resolve().parent
+
+
 def test_run_preserves_exact_local_artifact_and_complete_steps(tmp_path):
     root, artifact, ctx, config = run_inventory(tmp_path)
     manifest, events = inventory_lineage.read_bundle(artifact)
@@ -83,7 +89,7 @@ def test_modified_artifact_is_rejected_before_upload(tmp_path, monkeypatch):
 
 def test_modified_events_are_rejected(tmp_path):
     _, artifact, *_ = run_inventory(tmp_path)
-    event_path = next((artifact.parent / ".lineage").glob("*/events.jsonl"))
+    event_path = bundle_directory(artifact) / "events.jsonl"
     event_path.write_text("{}\n")
     with pytest.raises(SentierImporterError, match="event checksum"):
         inventory_lineage.read_bundle(artifact)
@@ -96,7 +102,7 @@ def test_repeated_runs_preserve_history_and_independent_endpoints(tmp_path):
     second, _ = inventory_lineage.read_bundle(artifact)
     _, exchanges, *_ = run_inventory(tmp_path, "exchanges")
     assert first["runId"] != second["runId"]
-    assert len(list((artifact.parent / ".lineage").glob("*/manifest.json"))) == 3
+    assert len(list((artifact.parents[2] / "lineage/runs").glob("*/manifest.json"))) == 3
     assert inventory_lineage.read_bundle(exchanges)[0]["artifact"] == "exchanges.parquet"
     assert inventory_lineage.read_bundle(artifact)[0]["runId"] == second["runId"]
 

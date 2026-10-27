@@ -47,8 +47,10 @@ def test_run_source_dry_run_does_not_deliver(tmp_path, monkeypatch):
 def test_run_source_delivers_when_not_dry_run(tmp_path, monkeypatch):
     called = {}
 
-    def fake_deliver(files, target, *, branch, title, body, ctx):
+    def fake_deliver(files, target, *, branch, title, body, ctx, category, with_lineage):
         called["branch"] = branch
+        assert category == "example"
+        assert with_lineage
         return "https://github.com/o/r/pull/9"
 
     monkeypatch.setattr(pipeline.deliver_mod, "deliver", fake_deliver)

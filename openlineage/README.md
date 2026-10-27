@@ -88,6 +88,78 @@ package. The cut's upstream preparation is declared context, not fabricated exec
 history. Choose the cut declaration explicitly; the default source describes the full
 registry. Unknown publisher, licence and release metadata stay unknown.
 
+## Deliver data and lineage together
+
+`run <source> --deliver` creates one PR containing the emitted artifact, its pointer
+and its complete import history. Git/GitHub CLI authentication and permission to
+push a PR branch on the target repository are required. For example:
+
+```sh
+uv run sentier-importers run bafu-processes --input-file "../source_data/BAFU-2026 v1_ecoSpold v1.zip" --deliver
+```
+
+The target layout is portable across clones:
+
+```text
+data/bafu-2026-v1/processes.parquet
+data/bafu-2026-v1/.lineage/processes.parquet.json
+lineage/runs/<run-id>/manifest.json
+lineage/runs/<run-id>/events.jsonl
+lineage/runs/<run-id>/upstream/...       # verified input history, if available
+.gitattributes                        # preserve exact bytes across Git checkouts
+```
+
+Delivery preserves the category folder and unrelated files. Each pointer identifies
+the exact artifact checksum and a repository-relative bundle location. Existing run
+history is immutable; a new run updates its artifact's pointer and adds a new bundle.
+Verified pointers/bundles are explicitly staged even if ignored by the target.
+Git attributes prevent checkout newline conversion from breaking data/event checksums.
+
+The import finishes and its recording is frozen before Git/PR operations. A failed
+PR does not change a successful import into a failed run. Bundles retain the original
+import dataset identities: opening a PR does not claim merge or publication on main.
+Publication events/automatic public-server indexing can be added separately.
+
+`--deliver-local <checkout>` exports the same portable layout without Git operations.
+`--lineage-store` affects staging; delivered bundles never depend on that store.
+A user cloning the accepted PR can inspect its file without the contributor's
+computer, cache or staging directory:
+
+```sh
+uv run inspect-lineage --artifact ../sentier-inventory/data/bafu-2026-v1/processes.parquet
+```
+
+This applies to all four targets and JSON/YAML/Parquet outputs. Delivery emits only
+the artifact selected by the source; it does not invent release files/metadata needed
+by target validators. Review the data and bundled source previews/code before publication.
+
+## Choose a Marquez server
+
+By default, inspection uploads to the local API on port 5000 and links to the UI
+on port 3000. For API and UI served under one base URL:
+
+```sh
+uv run inspect-lineage --artifact path/to/processes.parquet --marquez-url https://lineage.example.org
+```
+
+`--marquez-url` accepts a common origin/path prefix, or an API base ending in
+`/api/v1`. For split deployments, set `--marquez-api` and `--marquez-web`; explicit
+values override the common URL. A custom API port need not serve the UI.
+These options do not deploy a server or configure its authentication/rate limits.
+
+For an existing public/read-only index, query without submitting events:
+
+```sh
+uv run inspect-lineage --artifact path/to/processes.parquet --marquez-url https://lineage.example.org --no-upload
+```
+
+This performs only a graph lookup after verifying the local artifact/bundle. If
+that exact run/version is not indexed, it reports this rather than uploading.
+The address is a placeholder; no public Sentier server is assumed to exist. Its
+operator must ingest accepted bundles separately. Delivery does not upload to
+Marquez automatically. Default inspection still uploads to the selected instance,
+which remains useful for contributors' own servers.
+
 ## Source and transformation contract
 
 Registry entries select a source module, primary URL/format, target, category,
@@ -151,11 +223,11 @@ apply to one source, not `--all`.
 - Every job emits `START` then `COMPLETE`, or `FAIL`. Exceptions are re-raised;
   failure facets exclude raw exception messages/tracebacks that may reveal local data.
 - Working JSONL defaults to `output/lineage/<source>.openlineage.jsonl`. Repeated
-  runs replace that working file; successful dry-run outputs retain immutable history.
+  runs replace that working file; successful output-producing imports retain immutable history.
 - `.lineage/<filename>.json` points to a version-2 bundle containing `events.jsonl`,
-  `manifest.json` and verified upstream bundles. Defaults live in `.lineage/<run-id>/`;
-  `--lineage-store` relocates the store. Keep pointers, artifacts and referenced bundles
-  together, or update the local store reference when relocating them.
+  `manifest.json` and verified upstream bundles. Staging defaults to `.lineage/<run-id>/`;
+  `--lineage-store` relocates that store. Delivered history lives in the target's
+  `lineage/runs/`. Keep pointers, artifacts and referenced bundles together.
 - Inspection verifies artifact/event checksums and successful run linkage, uploads
   upstream events in order, checks the graph, and prints its URL. It does not re-import
   data. Legacy data without a compatible bundle reports no lineage information.
@@ -172,17 +244,18 @@ apply to one source, not `--all`.
 Only explicitly provided `--contributor <public-id>` is recorded as a contributor.
 Keep secrets, personal details and sensitive paths out of captured/committed code.
 Previews contain real source values and must be handled under the data's terms.
-Facet JSON schemas in `facets/` are implementation contracts; generated events,
-data, cache files and local development material are not committed.
+Facet JSON schemas in `facets/` are implementation contracts. The importer code
+repository excludes generated data/events and local working material. Delivery
+explicitly includes the selected artifact and verified history in its target repo.
 
 Inspection defaults to depth 8; `--depth` overrides it. API/UI locations are configurable
-with `--marquez-api` and `--marquez-web`. Marquez lists are namespace-filtered; the
+with `--marquez-url`, `--marquez-api` and `--marquez-web`. Lists are namespace-filtered; the
 printed dataset link avoids navigating the wrong namespace.
 
 Validation enforces only the configured schema. These commands stage example files;
 complete release metadata, target-repository validation and publication are separate
-steps. Remote PR delivery behavior is unchanged by lineage; published lineage
-distribution and Brightway integration remain outside these local examples.
+steps. Public Marquez operation, automatic indexing after merge, and Brightway
+integration remain separate work; portable lineage delivery is supported now.
 
 ## Checks
 

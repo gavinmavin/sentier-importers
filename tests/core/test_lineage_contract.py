@@ -15,7 +15,7 @@ from sentier_importers.core.errors import SentierImporterError, SourceContractEr
 from sentier_importers.core.source import SourceConfig, TransformStep
 from sentier_importers.core.types import RawData
 
-from tests.core.test_inventory_lineage import InventorySource, run_inventory
+from tests.core.test_inventory_lineage import InventorySource, bundle_directory, run_inventory
 
 
 def test_examples_scan_past_first_five_rows_and_skip_nulls():
@@ -222,7 +222,7 @@ def test_unused_secondary_input_does_not_create_a_dependency(tmp_path):
 
 def test_corrupt_upstream_bundle_is_not_treated_as_legacy(tmp_path):
     _, upstream, *_ = run_inventory(tmp_path)
-    event_file = next((upstream.parent / ".lineage").glob("*/events.jsonl"))
+    event_file = bundle_directory(upstream) / "events.jsonl"
     event_file.write_text("{}")
     # Use a separate consumer setup so the producer's pointer is not advanced.
     config = SourceConfig(
@@ -245,7 +245,7 @@ def test_missing_frozen_upstream_fails_before_contacting_marquez(tmp_path, monke
     _, upstream, *_ = run_inventory(tmp_path)
     output = run_consumer(tmp_path, upstream)
     manifest, _ = inventory_lineage.read_bundle(output)
-    archive = output.parent / ".lineage" / manifest["runId"]
+    archive = bundle_directory(output)
     (archive / manifest["dependencies"][0]["manifest"]).unlink()
 
     def unexpected(*args, **kwargs):
