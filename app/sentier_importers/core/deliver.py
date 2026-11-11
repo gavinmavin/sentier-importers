@@ -31,6 +31,9 @@ def _remove_stale_same_stem(dest: Path) -> None:
     """
     for sibling in dest.parent.glob(f"{dest.stem}.*"):
         if sibling.name != dest.name:
+            bundle = inventory_lineage._current_folder(sibling)
+            if bundle.is_dir():
+                shutil.rmtree(bundle)
             sibling.unlink()
             pointer = dest.parent / ".lineage" / f"{sibling.name}.json"
             if pointer.is_file():
@@ -88,7 +91,7 @@ def deliver(
     In dry-run mode this performs no git/gh operations. Otherwise it clones the
     target into a working dir under the cache, creates ``branch``, copies the files
     into ``target.output_subdir/category``. With lineage, it also exports portable
-    pointers, immutable bundles and byte-preserving attributes into the same commit,
+    current bundles and byte-preserving attributes into the same commit,
     then pushes and runs ``gh pr create``.
     """
     if ctx.dry_run:
@@ -121,7 +124,7 @@ def deliver(
 
         _run(["git", "add", "--", target.output_subdir], cwd=workdir)
         if lineage_paths:
-            # Force only the verified bundle/pointer paths if a target ignores
+            # Force only the verified current bundles if a target ignores
             # generated lineage globally; never force-add the contributor's store.
             _run(
                 [

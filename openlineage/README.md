@@ -1,170 +1,146 @@
 # Import lineage
 
-The normal importer pipeline records OpenLineage events for inventory, vocabulary,
-methods and mappings. An import is a parent job; framework stages and declared
-source transformations are child jobs connected through their datasets.
+The importer records OpenLineage events for inventory, vocabulary, methods and
+mappings. Each import is a parent job; framework stages and declared source
+transformations are child jobs connected through their input and output datasets.
+Recordings describe source provenance, code, execution times, schemas, counts and
+previews. Marquez displays the recorded graph without re-running the import.
+
+See [this graph](inventory-import-workflow.md) for an inventory import example.
 
 ```text
 fetch -> parse -> source transformations -> deduplicate -> assemble -> validate -> emit
                                                                                 -> deliver (optional)
 ```
 
-Runs stage data locally by default. They do not contact Marquez or open a PR.
-Inspection uploads a verified recording and returns a link to its output dataset.
+## Run and inspect
 
-## Setup
-
-Commands below run from the `sentier-importers` checkout. Use Python 3.10+ and uv:
+Run commands from the `sentier-importers` checkout. Python 3.10+ and uv are required:
 
 ```sh
-uv sync --inexact --extra dev
+uv sync
 uv run sentier-importers list
+uv run sentier-importers run <source>
 ```
 
-The four examples use sibling `source_data/` inputs and the `sentier-vocab` checkout's
-schemas. These private/licensed inputs are obtained separately and are not committed.
-Registry paths remain compatible with the original source layouts; `--input-file`
-selects an available local copy without editing the registry or writing a runner.
+Replace `<source>` with a registry name. Imports stage data under
+`output/<target>/<category>/` by default. They record lineage locally without
+contacting Marquez or opening a PR. `validate <source>` records execution through
+validation but does not emit an artifact or create an inspectable artifact bundle.
 
-Marquez must be running when inspecting. The tested local instance exposes its API
-at `http://localhost:5000` and UI at `http://localhost:3000`. In an existing Marquez
-checkout, `./docker/up.sh --detach` starts its stack; omit `--seed` to start without
-sample events. Use that deployment's own shutdown/storage controls when resetting:
-both PostgreSQL history and the search index must be cleared for an empty instance.
+Inputs come from `registry.yaml`. `--data-root DIR` overrides their base directory;
+otherwise `SENTIER_DATA_ROOT` or the parent of this checkout is used. For a single
+source, `--input-file FILE` selects a local primary input without changing the
+registry. `--schema-dir DIR` selects local validation schemas instead of the target's
+pinned schema reference. Obtain private or licensed inputs from their providers.
 
-## Four examples using normal execution
-
-### Inventory: BAFU processes
+To inspect a successfully emitted file, start a Marquez deployment, then run:
 
 ```sh
-uv run sentier-importers run bafu-processes --input-file "../source_data/BAFU-2026 v1_ecoSpold v1.zip"
-uv run inspect-lineage --artifact output/sentier_inventory/bafu-2026-v1/processes.parquet --depth 16
+uv run inspect-lineage --artifact path/to/output.parquet
 ```
 
-The standard parser reads the original EcoSpold 1 ZIP. `map-process-rows` emits
-11,947 process rows with reference product/unit/amount, sector and source identity.
-For the corresponding exchange table, run `bafu-exchanges` with the same input.
-XML repairs and EcoSpold 2 conversion are separate from this example.
+Inspection verifies the artifact, events and available upstream bundles, submits
+events upstream first, checks that the output graph exists, and prints its browser
+URL. It reads local files; clone remote artifacts together with their lineage before
+inspection. It does not upload the source file or emitted artifact. Datasets without
+a compatible bundle report `No lineage information available for this endpoint`.
 
-### Vocabulary: EFSA FoodEx2 qualifiers
+Inventory outputs can also be selected by source folder and endpoint:
 
 ```sh
-uv run sentier-importers run foodex2-qualifiers --input-file ../source_data/MTX.ecf --schema-dir ../sentier-vocab/schemas
-uv run inspect-lineage --artifact output/sentier_vocab/qualifiers/foodex2-qualifiers.parquet --depth 16
+uv run inspect-lineage <source-folder> --processes
+uv run inspect-lineage <source-folder> --exchanges
 ```
 
-The source reads EFSA's ECF catalogue, selects qualifiers, maps vocabulary terms and
-validates the collection. `foodex2-products` and `foodex2-organisms` use the same input.
-Without `--schema-dir`, validation resolves the registry target's schema reference.
+These selectors use the sibling `sentier-inventory` checkout by default.
+`--inventory-root DIR` selects another checkout or inventory staging root.
+Use `--artifact` for an exact file path or outputs from the other targets.
+Inspection defaults to graph depth 8; `--depth N` overrides it.
 
-### Methods: JRC EF 3.1
+## Recording locations
 
-```sh
-uv run sentier-importers run methods --input-file "../source_data/EF-LCIAMethod_CF(EF-v3.1)__lciamethods_CF.parquet"
-uv run sentier-importers run characterization-factors --input-file "../source_data/EF-LCIAMethod_CF(EF-v3.1)__lciamethods_CF.parquet"
-uv run inspect-lineage --artifact output/sentier_methods/01-ef-3.1/methods.parquet --depth 16
-uv run inspect-lineage --artifact output/sentier_methods/01-ef-3.1/characterization-factors.parquet --depth 16
-```
+| Location | Contents and lifecycle |
+|---|---|
+| `output/lineage/<source>.openlineage.jsonl` | Working event log; replaced by the next run of the same source. `--lineage-dir DIR` changes its directory. |
+| `<artifact-directory>/.lineage/<filename>/` | Complete bundle for the current artifact: `manifest.json`, `events.jsonl` and available `upstream/` bundles. Replaced when a new successful run replaces the artifact. |
+| `output/lineage/runs/<run-id>/` | Separate immutable history for each successful import. `--lineage-store DIR` relocates this archive; it does not move the current bundle. |
 
-The supplied 319,575-row table produces 25 methods and 319,393 factors. The CF
-importer resolves duplicate global factors and harmonises water factors. Its optional
-`inputs.simapro` reference is configured in the registry. If unavailable, the existing
-land-use fallback applies; the transformation description records its absence.
-This can change factor values relative to data produced with the arbiter. It is
-not a scientific equivalence claim. The same input also supports `ef-lcia-method`
-and `ef-impact-categories`, with `--schema-dir` for their vocabulary validation.
-
-### Mappings: Agribalyse to EF
-
-```sh
-uv run sentier-importers run biosphere --input-file ../source_data/mappings_biosphere.parquet --source-provenance agribalyse-3.2-ef-3.1-curated-cut
-uv run inspect-lineage --artifact output/sentier_mappings/agribalyse-3.2__ef-3.1/biosphere.json --depth 16
-```
-
-The supplied cut contains 1,095 curated/LLM-reviewed entries. The source still runs
-its guardrail (allowed targets, no ecoinvent provenance, no identity layer), then maps
-replacement entries and assembles a randonneur package. Its output matches the reference
-package. The cut's upstream preparation is declared context, not fabricated execution
-history. Choose the cut declaration explicitly; the default source describes the full
-registry. Unknown publisher, licence and release metadata stay unknown.
+The manifest records the producing run and checksums binding the artifact to its
+events. Keep the artifact and its adjacent `.lineage/<filename>/` directory
+together. Inspection does not need the working log or historical archive, even
+when `--lineage-store` selects an external directory. `--output-dir DIR` changes
+the staging base, default working-log directory and default historical archive.
+`--lineage-dir` affects only the working log. Older pointer-based bundles remain
+readable; a new run writes the adjacent layout and removes its superseded pointer.
+Failed runs retain their working events but do not get successful artifact bundles.
 
 ## Deliver data and lineage together
 
-`run <source> --deliver` creates one PR containing the emitted artifact, its pointer
-and its complete import history. Git/GitHub CLI authentication and permission to
-push a PR branch on the target repository are required. For example:
-
 ```sh
-uv run sentier-importers run bafu-processes --input-file "../source_data/BAFU-2026 v1_ecoSpold v1.zip" --deliver
+uv run sentier-importers run <source> --deliver
 ```
 
-The target layout is portable across clones:
+Delivery opens one PR containing the selected artifact and its complete current
+verified import history. Git/GitHub CLI authentication and permission to push a PR
+branch on the target repository are required. Category folders are preserved.
+For inventory, the delivered layout is:
 
 ```text
-data/bafu-2026-v1/processes.parquet
-data/bafu-2026-v1/.lineage/processes.parquet.json
-lineage/runs/<run-id>/manifest.json
-lineage/runs/<run-id>/events.jsonl
-lineage/runs/<run-id>/upstream/...       # verified input history, if available
-.gitattributes                        # preserve exact bytes across Git checkouts
+data/<source-folder>/<filename>
+data/<source-folder>/.lineage/<filename>/manifest.json
+data/<source-folder>/.lineage/<filename>/events.jsonl
+data/<source-folder>/.lineage/<filename>/upstream/  # available verified input history
+.gitattributes                   # preserve artifact and lineage bytes across clones
 ```
 
-Delivery preserves the category folder and unrelated files. Each pointer identifies
-the exact artifact checksum and a repository-relative bundle location. Existing run
-history is immutable; a new run updates its artifact's pointer and adds a new bundle.
-Verified pointers/bundles are explicitly staged even if ignored by the target.
-Git attributes prevent checkout newline conversion from breaking data/event checksums.
+A new run replaces the artifact and its matching current bundle. Historical runs
+remain in the contributor's archive; delivery does not copy that archive into the
+target. Delivery stages verified current bundles even when ignored by the target.
+Git attributes prevent
+newline conversion from breaking checksums. Delivered bundles do not depend on the
+contributor's staging directory, cache or external lineage store.
 
-The import finishes and its recording is frozen before Git/PR operations. A failed
-PR does not change a successful import into a failed run. Bundles retain the original
-import dataset identities: opening a PR does not claim merge or publication on main.
-Publication events/automatic public-server indexing can be added separately.
+The import completes before Git/PR operations. A PR failure does not change the
+successful import recording. Bundles retain the original import dataset identities;
+opening a PR does not record a merge or publication on main.
 
-`--deliver-local <checkout>` exports the same portable layout without Git operations.
-`--lineage-store` affects staging; delivered bundles never depend on that store.
-A user cloning the accepted PR can inspect its file without the contributor's
-computer, cache or staging directory:
+`--deliver-local CHECKOUT` copies the artifact and portable lineage into an existing
+target checkout without Git operations. Both delivery modes retain the staged output
+and apply to all four targets and supported output formats. They deliver the selected
+artifact; complete release metadata and target-repository validation are separate
+requirements. Review captured code and source previews before publishing.
+
+## Marquez connection
+
+The default API is `http://localhost:5000`; the default UI is
+`http://localhost:3000`. Inspection requires an already running server.
+For a deployment with one API/UI base URL:
 
 ```sh
-uv run inspect-lineage --artifact ../sentier-inventory/data/bafu-2026-v1/processes.parquet
+uv run inspect-lineage --artifact path/to/output.parquet --marquez-url https://lineage.example.org
 ```
 
-This applies to all four targets and JSON/YAML/Parquet outputs. Delivery emits only
-the artifact selected by the source; it does not invent release files/metadata needed
-by target validators. Review the data and bundled source previews/code before publication.
+For separate API and UI addresses, use `--marquez-api` and `--marquez-web`; these
+values override `--marquez-url`. A base URL may include a path prefix or end in
+`/api/v1`. Connection options do not deploy a server or configure authentication.
 
-## Choose a Marquez server
-
-By default, inspection uploads to the local API on port 5000 and links to the UI
-on port 3000. For API and UI served under one base URL:
+To inspect an existing server index without submitting events:
 
 ```sh
-uv run inspect-lineage --artifact path/to/processes.parquet --marquez-url https://lineage.example.org
+uv run inspect-lineage --artifact path/to/output.parquet --marquez-url https://lineage.example.org --no-upload
 ```
 
-`--marquez-url` accepts a common origin/path prefix, or an API base ending in
-`/api/v1`. For split deployments, set `--marquez-api` and `--marquez-web`; explicit
-values override the common URL. A custom API port need not serve the UI.
-These options do not deploy a server or configure its authentication/rate limits.
-
-For an existing public/read-only index, query without submitting events:
-
-```sh
-uv run inspect-lineage --artifact path/to/processes.parquet --marquez-url https://lineage.example.org --no-upload
-```
-
-This performs only a graph lookup after verifying the local artifact/bundle. If
-that exact run/version is not indexed, it reports this rather than uploading.
-The address is a placeholder; no public Sentier server is assumed to exist. Its
-operator must ingest accepted bundles separately. Delivery does not upload to
-Marquez automatically. Default inspection still uploads to the selected instance,
-which remains useful for contributors' own servers.
+This still verifies the local artifact and bundle, then requests the dataset graph.
+If the server has no matching graph, inspection reports that lineage is not indexed.
+The URL above is illustrative. Delivery does not automatically index events on any
+Marquez server.
 
 ## Source and transformation contract
 
 Registry entries select a source module, primary URL/format, target, category,
-output format and optional validation contract. Target folders and filenames are
-unchanged by lineage. `enabled: false` sources remain runnable by name.
+output format and optional validation contract. `enabled: false` sources remain
+runnable by name.
 
 A module exposes one `Source` subclass. Inherited `fetch()` reads/caches the registry
 URL and named inputs; override `parse()` for source-specific extraction. Declare
@@ -190,7 +166,7 @@ parsed records through. Declare directly used helper files for job-scoped code e
 Secondary inputs belong in registry `inputs`. Consume them through `self.inputs[name]`
 or `self.input_path(name)` during a step, and declare their roles in `TransformStep.inputs`.
 The framework fingerprints consumed bytes/directories, adds upstream graph edges and
-replays verified available upstream bundles. Undeclared reads through these interfaces
+preserves verified available upstream bundles. Undeclared reads through these interfaces
 fail. Untracked filesystem/network reads bypass this contract and must not be used
 for dependencies that affect output. Missing upstream history is `not-recorded`.
 
@@ -213,59 +189,35 @@ Only a fresh HTTP acquisition records `downloadedAt`; cache/local reads do not i
 a historical download date. Import time is never substituted for publication time.
 Provider attribution is separate from the optional public run contributor.
 
-`--source-provenance <key>` selects an existing declaration for an explicitly chosen
+`--source-provenance KEY` selects an existing declaration for an explicitly chosen
 input; it does not create one or infer its correctness from a filename. Named inputs
 must already have provenance declarations. `--input-file` and `--source-provenance`
 apply to one source, not `--all`.
 
-## Recordings, inspection and privacy
+## Recorded evidence and privacy
 
-- Every job emits `START` then `COMPLETE`, or `FAIL`. Exceptions are re-raised;
-  failure facets exclude raw exception messages/tracebacks that may reveal local data.
-- Working JSONL defaults to `output/lineage/<source>.openlineage.jsonl`. Repeated
-  runs replace that working file; successful output-producing imports retain immutable history.
-- `.lineage/<filename>.json` points to a version-2 bundle containing `events.jsonl`,
-  `manifest.json` and verified upstream bundles. Staging defaults to `.lineage/<run-id>/`;
-  `--lineage-store` relocates that store. Delivered history lives in the target's
-  `lineage/runs/`. Keep pointers, artifacts and referenced bundles together.
-- Inspection verifies artifact/event checksums and successful run linkage, uploads
-  upstream events in order, checks the graph, and prints its URL. It does not re-import
-  data. Legacy data without a compatible bundle reports no lineage information.
+- Every job emits `START` then `COMPLETE`, or `FAIL`. Failure facets exclude raw
+  exception messages and tracebacks that may reveal local data.
 - Dataset names are filenames. Abstract namespaces distinguish workspace, target,
   release, run and SHA-256 without exporting physical paths, OS users or hostnames.
-- Code facets include the actual transformation callable, relative implementation
-  paths, file hashes, Git commit and job-scoped `codeDirty`. A dirty source link points
-  to the committed baseline; captured source/hashes describe the local execution.
-- Schemas/counts, transformation statistics, up to five row previews, and three distinct
-  non-null column examples support inspection. This is not arbitrary row tracing.
-  Object-valued mapping `source`/`target` preview cells use declared JSON text encoding
-  to avoid Marquez search-index conflicts; emitted data/schema types stay structured.
+- Code facets include transformation callables, relative implementation paths, file
+  hashes, Git commit and job-scoped `codeDirty`. When local code differs, a source
+  link points to the committed baseline; captured source and hashes describe execution.
+- Schemas, row counts, transformation statistics, previews of up to five rows, and
+  up to three distinct non-null examples per schema field support inspection.
+  These describe processing stages, not arbitrary row-level tracing.
+- Object-valued mapping `source`/`target` preview cells use declared JSON text
+  encoding to avoid Marquez search-index conflicts. Emitted data types stay structured.
 
-Only explicitly provided `--contributor <public-id>` is recorded as a contributor.
-Keep secrets, personal details and sensitive paths out of captured/committed code.
-Previews contain real source values and must be handled under the data's terms.
-Facet JSON schemas in `facets/` are implementation contracts. The importer code
-repository excludes generated data/events and local working material. Delivery
-explicitly includes the selected artifact and verified history in its target repo.
+Only an explicitly provided `--contributor PUBLIC_ID` is recorded as a contributor.
+Keep secrets, personal details and sensitive paths out of captured code. Previews
+contain real source values and are subject to the data's terms.
 
-Inspection defaults to depth 8; `--depth` overrides it. API/UI locations are configurable
-with `--marquez-url`, `--marquez-api` and `--marquez-web`. Lists are namespace-filtered; the
-printed dataset link avoids navigating the wrong namespace.
-
-Validation enforces only the configured schema. These commands stage example files;
-complete release metadata, target-repository validation and publication are separate
-steps. Public Marquez operation, automatic indexing after merge, and Brightway
-integration remain separate work; portable lineage delivery is supported now.
-
-## Checks
-
-```sh
-uv run pytest tests
-uv run ruff check app
-```
-
-Tests use synthetic input and temporary recordings. `--output-dir`, `--cache-dir`,
-`--lineage-dir`, `--lineage-store` and `--schema-dir` can isolate local work. Neither
-unit tests nor a normal `run` populate Marquez; only inspection sends events.
-On Windows, choose a short test temporary directory or lineage-store path when
-testing deeply nested upstream bundles to stay within filesystem path limits.
+Custom facet schemas live in [`facets/`](facets/). Recording, bundle inspection and
+source provenance are implemented in
+[`core/lineage.py`](../app/sentier_importers/core/lineage.py),
+[`core/inventory_lineage.py`](../app/sentier_importers/core/inventory_lineage.py)
+and [`core/provenance.py`](../app/sentier_importers/core/provenance.py) respectively.
+This code repository excludes generated
+artifacts and recordings; delivery includes the selected artifact and verified
+history in the target repository.

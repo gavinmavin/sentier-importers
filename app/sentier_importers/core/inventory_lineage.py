@@ -5,7 +5,7 @@ import copy
 import hashlib
 import io
 import json
-import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
@@ -80,13 +80,19 @@ def _load_archive(path, active=None):
 
 
 def _bundle_snapshot(artifact):
+    artifact = Path(artifact)
+    current = artifact.parent / ".lineage" / artifact.name
     pointer = artifact.parent / ".lineage" / f"{artifact.name}.json"
-    if not pointer.exists():
+    if not current.exists() and not pointer.exists():
         return None
     try:
-        index = json.loads(pointer.read_text(encoding="utf-8"))
-        store = (pointer.parent / index.get("store", ".")).resolve()
-        path = _contained(store, index["manifest"])
+        if current.exists():
+            path = _contained(current, "manifest.json")
+        else:
+            # Read existing recordings without migrating or rewriting history.
+            index = json.loads(pointer.read_text(encoding="utf-8"))
+            store = (pointer.parent / index.get("store", ".")).resolve()
+            path = _contained(store, index["manifest"])
         header = json.loads(path.read_text(encoding="utf-8"))
         if header.get("formatVersion") == 1:
             return None  # prior recordings may expose local identities; never replay them
@@ -127,7 +133,47 @@ def _write_archive(folder, snapshot):
     return manifest
 
 
-def preserve(artifact, recorder, store=None):
+def _archive_run(store, snapshot):
+    """Retain a successful run without changing an existing run's history."""
+    folder = _contained(Path(store), snapshot["manifest"]["runId"])
+    if (folder / "manifest.json").exists():
+        if _load_archive(folder / "manifest.json") != snapshot:
+            raise SentierImporterError("Conflicting existing lineage run; history is immutable")
+    elif folder.exists():
+        raise SentierImporterError("Existing lineage run folder is incomplete")
+    else:
+        _write_archive(folder, snapshot)
+    return folder
+
+
+def _current_folder(artifact):
+    return _contained(artifact.parent, f".lineage/{artifact.name}")
+
+
+def _install_current(artifact, snapshot):
+    """Prepare a complete bundle before replacing the artifact's current bundle."""
+    folder = _current_folder(artifact)
+    folder.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".bundle-", dir=folder.parent) as temporary:
+        temporary = Path(temporary)
+        prepared, previous = temporary / "new", temporary / "previous"
+        _write_archive(prepared, snapshot)
+        _load_archive(prepared / "manifest.json")
+        if folder.exists():
+            folder.rename(previous)
+        try:
+            prepared.rename(folder)
+        except BaseException:
+            if previous.exists():
+                previous.rename(folder)
+            raise
+    # New recordings are self-contained; remove a superseded legacy locator only.
+    pointer = artifact.parent / ".lineage" / f"{artifact.name}.json"
+    pointer.unlink(missing_ok=True)
+    return folder
+
+
+def preserve(artifact, recorder, store):
     recorder.flush()
     events = [json.loads(line) for line in recorder.path.read_text(encoding="utf-8").splitlines()]
     terminal = events[-1]
@@ -158,27 +204,18 @@ def preserve(artifact, recorder, store=None):
         "events": "events.jsonl",
         "dependencies": dependencies,
     }
-    pointer_dir = artifact.parent / ".lineage"
-    pointer_dir.mkdir(parents=True, exist_ok=True)
-    store = store.resolve() if store else pointer_dir.resolve()
-    folder = store / recorder.parent_run_id
-    _write_archive(folder, {"manifest": manifest, "events": events, "children": children})
-    try:
-        store_reference = os.path.relpath(store, pointer_dir)
-    except ValueError:
-        # Windows stores on another drive need a private absolute locator.
-        store_reference = str(store)
-    _write_json(
-        pointer_dir / f"{artifact.name}.json",
-        {
-            "store": store_reference,
-            "manifest": f"{recorder.parent_run_id}/manifest.json",
-        },
-    )
+    snapshot = {"manifest": manifest, "events": events, "children": children}
+    current = _current_folder(artifact)
+    store = Path(store).resolve()
+    if store.is_relative_to(current) or current.is_relative_to(store):
+        raise SentierImporterError("Historical lineage store must be separate from current bundle")
+    folder = _archive_run(store, snapshot)
+    # Reload canonical serialization so archive and portable current copy agree.
+    _install_current(artifact, _load_archive(folder / "manifest.json"))
 
 
 def export_bundle(source, destination, repository_root):
-    """Copy verified history into a portable, versioned target-repository layout.
+    """Copy the current self-contained bundle beside the delivered artifact.
 
     The destination artifact must already contain the same bytes. Original import
     identities are retained; this does not assert that a PR has been merged.
@@ -193,39 +230,21 @@ def export_bundle(source, destination, repository_root):
     manifest = snapshot["manifest"]
     if destination.name != manifest["artifact"] or file_sha256(destination) != manifest["sha256"]:
         raise SentierImporterError("Delivered artifact differs from its lineage bundle")
-    store = _contained(root, "lineage/runs")
-    folder = _contained(store, manifest["runId"])
-    if (folder / "manifest.json").exists():
-        existing = _load_archive(folder / "manifest.json")
-        if existing != snapshot:
-            raise SentierImporterError("Conflicting existing lineage run; history is immutable")
-    elif folder.exists():
-        raise SentierImporterError("Existing lineage run folder is incomplete")
-    else:
-        _write_archive(folder, snapshot)
-    pointer = _contained(root, str(destination.parent / ".lineage" / f"{destination.name}.json"))
-    pointer.parent.mkdir(parents=True, exist_ok=True)
-    _write_json(
-        pointer,
-        {
-            "store": Path(os.path.relpath(store, pointer.parent)).as_posix(),
-            "manifest": f"{manifest['runId']}/manifest.json",
-        },
-    )
-    _preserve_git_bytes(root, destination, pointer)
-    _bundle_snapshot(destination)  # Verify the exported pointer and entire archive.
-    return pointer, folder
+    folder = _install_current(destination, snapshot)
+    _preserve_git_bytes(root, destination, folder)
+    _bundle_snapshot(destination)
+    return (folder,)
 
 
-def _preserve_git_bytes(root, artifact, pointer):
+def _preserve_git_bytes(root, artifact, folder):
     """Git checkout newline conversion must not invalidate recorded checksums."""
     attributes = _contained(root, ".gitattributes")
     text = attributes.read_text(encoding="utf-8") if attributes.exists() else ""
+    artifact_path = "/" + artifact.resolve().relative_to(root).as_posix()
+    bundle_path = "/" + folder.resolve().relative_to(root).as_posix() + "/**"
     rules = [
-        json.dumps("/" + path.resolve().relative_to(root).as_posix(), ensure_ascii=False)
-        + " -text"
-        for path in (artifact, pointer)
-    ] + ["/lineage/runs/** -text"]
+        json.dumps(path, ensure_ascii=False) + " -text" for path in (artifact_path, bundle_path)
+    ]
     missing = [rule for rule in rules if rule not in text.splitlines()]
     if missing:
         if text and not text.endswith("\n"):

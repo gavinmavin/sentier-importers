@@ -55,7 +55,10 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cache-dir", default=None, help="Fetch cache directory.")
     parser.add_argument("--output-dir", default=None, help="Where to stage emitted files.")
     parser.add_argument(
-        "--lineage-store", type=Path, help="Separate local store for immutable lineage bundles."
+        "--lineage-store",
+        type=Path,
+        help="Historical run archive (default: <output-dir>/lineage/runs); "
+        "current bundles stay adjacent.",
     )
     parser.add_argument(
         "--contributor", help="Optional public contributor identity recorded in lineage."

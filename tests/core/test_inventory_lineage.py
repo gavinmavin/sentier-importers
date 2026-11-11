@@ -44,9 +44,7 @@ def run_inventory(tmp_path, name="processes", local=True):
 
 
 def bundle_directory(artifact):
-    pointer = artifact.parent / ".lineage" / f"{artifact.name}.json"
-    index = json.loads(pointer.read_text())
-    return (pointer.parent / index["store"] / index["manifest"]).resolve().parent
+    return artifact.parent / ".lineage" / artifact.name
 
 
 def test_run_preserves_exact_local_artifact_and_complete_steps(tmp_path):
@@ -96,13 +94,18 @@ def test_modified_events_are_rejected(tmp_path):
 
 
 def test_repeated_runs_preserve_history_and_independent_endpoints(tmp_path):
-    _, artifact, *_ = run_inventory(tmp_path)
+    _, artifact, ctx, _ = run_inventory(tmp_path)
     first, _ = inventory_lineage.read_bundle(artifact)
     _, artifact, *_ = run_inventory(tmp_path)
     second, _ = inventory_lineage.read_bundle(artifact)
     _, exchanges, *_ = run_inventory(tmp_path, "exchanges")
     assert first["runId"] != second["runId"]
-    assert len(list((artifact.parents[2] / "lineage/runs").glob("*/manifest.json"))) == 3
+    assert len(list((ctx.output_dir / "lineage/runs").glob("*/manifest.json"))) == 3
+    assert set(p.name for p in (artifact.parent / ".lineage").iterdir()) == {
+        "processes.parquet",
+        "exchanges.parquet",
+    }
+    assert not (artifact.parents[2] / "lineage/runs").exists()
     assert inventory_lineage.read_bundle(exchanges)[0]["artifact"] == "exchanges.parquet"
     assert inventory_lineage.read_bundle(artifact)[0]["runId"] == second["runId"]
 
@@ -198,6 +201,7 @@ def test_failed_run_never_creates_a_bundle(tmp_path):
 
 def test_pointer_cannot_escape_bundle(tmp_path):
     _, artifact, *_ = run_inventory(tmp_path)
+    bundle_directory(artifact).rename(artifact.parent / "old-bundle")
     pointer = artifact.parent / ".lineage" / "processes.parquet.json"
     pointer.write_text(json.dumps({"manifest": "../../outside.json"}))
     with pytest.raises(SentierImporterError, match="escapes"):

@@ -60,14 +60,15 @@ def test_private_failure_message_and_trace_are_not_exported(tmp_path):
     assert str(tmp_path).replace("\\", "\\\\") not in events
 
 
-def test_external_store_keeps_small_adjacent_pointer(tmp_path):
+def test_external_store_keeps_self_contained_adjacent_bundle(tmp_path):
     _, artifact, ctx, config = run_inventory(tmp_path)
     store = tmp_path / "shared-events"
     pipeline.run_source(InventorySource(config), replace(ctx, lineage_store=store))
-    pointer = json.loads((artifact.parent / ".lineage" / f"{artifact.name}.json").read_text())
-    assert pointer["store"] != "."
+    assert not (artifact.parent / ".lineage" / f"{artifact.name}.json").exists()
     manifest, _ = inventory_lineage.read_bundle(artifact)
     assert (store / manifest["runId"] / "events.jsonl").is_file()
+    store.rename(tmp_path / "unavailable-store")
+    assert inventory_lineage.read_bundle(artifact)[0] == manifest
 
 
 def test_depth_is_positive_and_used_in_both_graph_request_and_link(tmp_path, monkeypatch):
@@ -224,7 +225,7 @@ def test_corrupt_upstream_bundle_is_not_treated_as_legacy(tmp_path):
     _, upstream, *_ = run_inventory(tmp_path)
     event_file = bundle_directory(upstream) / "events.jsonl"
     event_file.write_text("{}")
-    # Use a separate consumer setup so the producer's pointer is not advanced.
+    # Use a separate consumer setup so the producer's current bundle is not replaced.
     config = SourceConfig(
         name="consumer",
         module=__name__,

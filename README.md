@@ -33,7 +33,7 @@ uv sync --extra dev
 ## Use
 
 See the [lineage guide](openlineage/README.md) for the source/transform contracts,
-provenance declarations, four local examples, and Marquez inspection commands.
+provenance declarations, recording locations, and Marquez inspection commands.
 Normal `run` and `validate` commands support `--input-file` for a local primary
 input and `--source-provenance` for its reusable registry declaration. Generated
 data and lineage records are local outputs, not part of this repository.

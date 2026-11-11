@@ -32,7 +32,7 @@ class RunContext:
     data_root: Path | None = None
     # Working JSONL location; bundles are archived independently.
     lineage_dir: Path | None = None
-    # Optional separate archive; adjacent pointers provide discovery.
+    # Historical runs only; each artifact always has a complete adjacent bundle.
     lineage_store: Path | None = None
     # Only an explicitly supplied public identity is recorded.
     contributor: str | None = None

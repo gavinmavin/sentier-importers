@@ -337,7 +337,9 @@ def run_source(source: Source, ctx: RunContext) -> Path:
         recorder.complete_parent([final])
         completed = True
         if archive_lineage:
-            inventory_lineage.preserve(out_path, recorder, ctx.lineage_store)
+            inventory_lineage.preserve(
+                out_path, recorder, ctx.lineage_store or ctx.output_dir / "lineage" / "runs"
+            )
             if ctx.deliver_local_root is not None:
                 inventory_lineage.export_bundle(out_path, local_path, ctx.deliver_local_root)
     except BaseException as error:

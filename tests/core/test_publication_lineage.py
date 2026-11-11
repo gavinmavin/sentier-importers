@@ -75,11 +75,8 @@ def test_pr_clone_is_self_contained(tmp_path, monkeypatch, target, fmt, name):
             manifest, events = inventory_lineage.read_bundle(artifact)
             assert events[-1]["eventType"] == "COMPLETE"
             assert not any(e["job"]["name"].endswith(".deliver") for e in events)
-            pointer = json.loads(
-                (artifact.parent / ".lineage" / f"{artifact.name}.json").read_text()
-            )
-            assert not Path(pointer["store"]).is_absolute()
-            assert "\\" not in pointer["store"]
+            assert (artifact.parent / ".lineage" / artifact.name / "manifest.json").is_file()
+            assert not (artifact.parent / ".lineage" / f"{artifact.name}.json").exists()
             committed.append(manifest)
             return real(
                 [
@@ -103,8 +100,9 @@ def test_pr_clone_is_self_contained(tmp_path, monkeypatch, target, fmt, name):
     checkout = ctx.cache_dir / "delivery" / target
     tree = git("ls-tree", "-r", "--name-only", "HEAD", cwd=checkout).splitlines()
     assert f"data/demo-v1/{staged.name}" in tree
-    assert f"data/demo-v1/.lineage/{staged.name}.json" in tree
-    assert f"lineage/runs/{committed[0]['runId']}/events.jsonl" in tree
+    assert f"data/demo-v1/.lineage/{staged.name}/manifest.json" in tree
+    assert f"data/demo-v1/.lineage/{staged.name}/events.jsonl" in tree
+    assert not any(path.startswith("lineage/runs/") for path in tree)
     assert "data/other/keep.json" in tree
     assert f"data/{staged.name}" not in tree
     fresh = tmp_path / "clone"
@@ -187,7 +185,7 @@ def test_upstream_export(tmp_path):
     inventory_lineage.export_bundle(source, dest, root)  # Identical histories may be reused.
 
 
-def test_export_refuses_wrong_bytes_and_conflicting_history(tmp_path):
+def test_export_refuses_wrong_bytes_and_replaces_current_bundle(tmp_path):
     _, source, *_ = run_inventory(tmp_path, local=False)
     root = tmp_path / "r"
     root.mkdir()
@@ -196,12 +194,12 @@ def test_export_refuses_wrong_bytes_and_conflicting_history(tmp_path):
     with pytest.raises(SentierImporterError, match="differs"):
         inventory_lineage.export_bundle(source, dest, root)
     shutil.copy2(source, dest)
-    _, folder = inventory_lineage.export_bundle(source, dest, root)
+    (folder,) = inventory_lineage.export_bundle(source, dest, root)
     manifest = json.loads((folder / "manifest.json").read_text())
     manifest["execution"]["contributor"] = "changed"
     (folder / "manifest.json").write_text(json.dumps(manifest))
-    with pytest.raises(SentierImporterError, match="immutable"):
-        inventory_lineage.export_bundle(source, dest, root)
+    inventory_lineage.export_bundle(source, dest, root)
+    assert inventory_lineage.read_bundle(dest) == inventory_lineage.read_bundle(source)
 
 
 @pytest.mark.parametrize("category", ["../outside", "/absolute", "C:/outside", "a\\b"])
